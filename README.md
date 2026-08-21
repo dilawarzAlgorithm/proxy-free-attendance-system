@@ -71,13 +71,13 @@ npm install
 npm start
 ```
 
-## <!-- 👥 Team Members
+<!--
+## 👥 Team Members
 
 - **\[Your Name\]** - System Architect & Backend
 - **\[Member 2\]** - Frontend UI/UX
 - **\[Member 3\]** - Database & Integrations
-- **\[Member 4\]** - QA & Testing
-  -->
+- **\[Member 4\]** - QA & Testing -->
 
 ## 📝 License
 
