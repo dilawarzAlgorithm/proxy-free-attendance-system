@@ -50,7 +50,7 @@ _(Note: Detailed System Design documentation including SRS, HLD, LLD, and DFDs a
 
 ```bash
 git clone https://github.com/dilawarzAlgorithm/proxy-free-attendance-system.git
-git  cd proxy-free-attendance
+git cd proxy-free-attendance
 ```
 
 ### 2\. Backend Setup (FastAPI)
