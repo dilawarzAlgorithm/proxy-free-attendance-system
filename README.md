@@ -6,37 +6,25 @@ A highly secure, offline-first attendance tracking system designed for large col
 
 Traditional attendance apps fail due to spotty classroom internet and rampant proxy marking (sharing links, sending screenshots, or carrying multiple phones). Our architecture is built **offline-first**, utilizing a Zero-Infrastructure Trust Triangle:
 
-1.  **Dynamic TOTP QR Codes** generated offline to stop screenshot sharing.
-2.  **Client-side WASM facial recognition** to prevent physical phone mules.
-3.  **Local IndexedDB caching** for zero data loss during internet drops.
+1.  **Dynamic TOTP QR Codes:** Generated offline to stop screenshot sharing.
+2.  **Client-side WASM facial recognition:** Prevents physical phone mules.
+3.  **Local IndexedDB caching:** Ensures zero data loss during internet drops.
 
 ## 🚀 Key Features
 
-### Student Module (PWA)
-
 - **Zero-Install PWA:** Runs directly in mobile browsers (Chrome/Safari) with offline caching.
 - **1:1 Hardware Device Binding:** Cryptographically locks the student account to their physical phone hardware via WebAuthn.
-- **On-Device Biometric Face Matching:** Compares live facial landmarks against a pre-registered 128D embedding locally using MediaPipe.
-- **Gaze Liveness Challenge:** Requires following a randomized moving dot to defeat pre-recorded videos.
-- **Offline Queue (IndexedDB):** Encrypts and saves attendance tokens locally, auto-syncing when internet restores.
-
-### Faculty Module (Web App)
-
-- **Offline Dynamic QR Engine:** Renders time-synchronized cryptographic QR codes locally every 5 seconds.
-- **Projector Optimization:** Large-module QR layouts optimized for optical line-of-sight scanning in 240-seat halls.
-- **Manual Override:** Toggle to manually mark students present in cases of hardware failure.
+- **On-Device Biometric Face Matching:** Compares live facial landmarks locally using MediaPipe.
+- **Offline Dynamic QR Engine:** Renders time-synchronized cryptographic QR codes locally on the professor's laptop every 5 seconds.
 - **Asynchronous Batch Export:** One-click instant download (.xlsx) or batched background push to Google Sheets.
 
 ## 🏗️ System Architecture & Design
 
-Our system follows a **Client-Server architecture with an Offline-First Edge layer**.
+To keep this repository clean, our detailed system architecture, flowcharts, and design diagrams are organized in the /docs folder.
 
-- **Backend:** Python FastAPI (Dockerized on Render) handling JWT auth and payload decryption.
-- **Database:** PostgreSQL (Neon DB) for primary relational data.
-- **Frontend:** React.js / Next.js Progressive Web App (hosted on Vercel).
-- **Anti-Rate Limiting:** Background queues (Celery/BackgroundTasks) batch-sync records to Google Sheets.
-
-_(Note: Detailed System Design documentation including SRS, HLD, LLD, and DFDs are located in the /docs folder)._
+- 🗺️ [**High-Level Design (HLD)**](https://github.com/dilawarzAlgorithm/proxy-free-attendance-system/blob/main/docs/DFD-College_Attendance_System.md)**:** System architecture overview, offline-sync pipeline, and node infrastructure.
+- 🧩 [**Low-Level Design (LLD)**](https://github.com/dilawarzAlgorithm/proxy-free-attendance-system/blob/main/docs/HLD-College_Attendance_System.md)**:** UML class diagrams, database entities, and design patterns (Singleton, Strategy).
+- 🔄 [**Data Flow Diagrams (DFD)**](https://github.com/dilawarzAlgorithm/proxy-free-attendance-system/blob/main/docs/LLD-College_Attendance_System.md)**:** Level 0 Context Diagram and Level 1 Sub-Process routing.
 
 ## 🛠️ Local Development Setup
 
@@ -44,16 +32,16 @@ _(Note: Detailed System Design documentation including SRS, HLD, LLD, and DFDs a
 
 - Node.js (v18+)
 - Python (3.10+)
-- Docker & Docker Compose
+- Docker & Docker Compose (Optional for DB)
 
-### 1\. Clone the Repository
+### 1. Clone the Repository
 
 ```bash
 git clone https://github.com/dilawarzAlgorithm/proxy-free-attendance-system.git
 git cd proxy-free-attendance
 ```
 
-### 2\. Backend Setup (FastAPI)
+### 2. Backend Setup (FastAPI)
 
 ```bash
 cd backend
@@ -63,21 +51,21 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-### 3\. Frontend Setup (React PWA)
+### 3. Frontend Setup (React PWA)
 
 ```bash
 cd frontend
 npm install
-npm start
+npm run dev
 ```
 
 <!--
 ## 👥 Team Members
 
-- **\[Your Name\]** - System Architect & Backend
-- **\[Member 2\]** - Frontend UI/UX
-- **\[Member 3\]** - Database & Integrations
-- **\[Member 4\]** - QA & Testing -->
+- **[Dilawar Singh]** - System Architect & Backend
+- **[Likhit]** - Frontend UI/UX
+- **[Atharv]** - Database & Integrations
+- **[Nisarg]** - QA & Testing -->
 
 ## 📝 License
 
