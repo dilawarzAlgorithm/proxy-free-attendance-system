@@ -38,7 +38,7 @@ To keep this repository clean, our detailed system architecture, flowcharts, and
 
 ```bash
 git clone https://github.com/dilawarzAlgorithm/proxy-free-attendance-system.git
-git cd proxy-free-attendance
+git cd proxy-free-attendance-system
 ```
 
 ### 2. Backend Setup (FastAPI)
