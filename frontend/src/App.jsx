@@ -25,7 +25,7 @@ async function initDB() {
 
 async function saveOfflineAttendance(record) {
   const db = await initDB();
-  await db.add(STORE_NAME, { ...record, timestamp: new Date().toISOString() });
+  await db.add(STORE_NAME, record);
 }
 
 async function getOfflineAttendance() {
@@ -40,8 +40,16 @@ async function clearOfflineQueue() {
   await tx.done;
 }
 
+// Security: Generate a SHA-256 hash locally in the browser to sign offline requests
+async function generateSignature(studentId, token, timestamp) {
+  const msgUint8 = new TextEncoder().encode(`${studentId}:${token}:${timestamp}`);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 export default function App() {
-  const [currentUser, setCurrentUser] = useState(null); // { id, role, name, email }
+  const [currentUser, setCurrentUser] = useState(null);
 
   if (!currentUser) {
     return <LoginSelection onLoginSuccess={setCurrentUser} />;
@@ -51,11 +59,11 @@ export default function App() {
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-indigo-500 selection:text-white">
       <nav className="bg-slate-900/80 backdrop-blur-md border-b border-slate-800 text-white px-6 py-4 shadow-lg sticky top-0 z-50 flex justify-between items-center">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-linear-to-tr from-indigo-600 to-violet-500 flex items-center justify-center shadow-lg shadow-indigo-500/20">
+          <div className="w-10 h-10 rounded-xl bg-indigo-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
             <ShieldCheck className="w-6 h-6 text-white" />
           </div>
           <div>
-            <span className="font-extrabold text-lg tracking-tight bg-linear-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent">TrustAttendance</span>
+            <span className="font-extrabold text-lg tracking-tight text-white">TrustAttendance</span>
             <span className="block text-[10px] text-indigo-400 font-semibold tracking-wider uppercase">Zero-Infrastructure Trust Triangle</span>
           </div>
         </div>
@@ -87,17 +95,15 @@ export default function App() {
 // 1. ADMIN PORTAL
 // ==========================================
 function AdminPortal() {
-  const [activeTab, setActiveTab] = useState('users'); // users or subjects
+  const [activeTab, setActiveTab] = useState('users'); 
   const [users, setUsers] = useState([]);
   const [subjects, setSubjects] = useState([]);
 
-  // Form states for creating user
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [role, setRole] = useState('student');
 
-  // Form states for creating subject
   const [subName, setSubName] = useState('');
   const [subCode, setSubCode] = useState('');
 
@@ -170,11 +176,11 @@ function AdminPortal() {
               </div>
               <div>
                 <label className="block text-xs font-bold text-slate-300 mb-1">Email / Username</label>
-                <input type="email" value={email} onChange={e => setEmail(e.target.value)} required className="w-full p-3 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white outline-none focus:border-indigo-500" />
+                <input type="email" value={email} onChange={e => setEmail(e.target.value)} required autoCapitalize="none" autoCorrect="off" className="w-full p-3 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white outline-none focus:border-indigo-500" />
               </div>
               <div>
                 <label className="block text-xs font-bold text-slate-300 mb-1">Password</label>
-                <input type="password" value={password} onChange={e => setPassword(e.target.value)} required className="w-full p-3 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white outline-none focus:border-indigo-500" />
+                <input type="password" value={password} onChange={e => setPassword(e.target.value)} required autoCapitalize="none" autoCorrect="off" className="w-full p-3 bg-slate-950 border border-slate-800 rounded-xl text-sm text-white outline-none focus:border-indigo-500" />
               </div>
               <div>
                 <label className="block text-xs font-bold text-slate-300 mb-1">Role</label>
@@ -284,7 +290,7 @@ function ProfessorApp({ professor }) {
   };
 
   const connectWebSocket = (code) => {
-    // Connect to the Render deployed WebSocket backend securely via wss://
+    // Render secures websockets automatically over wss://
     wsRef.current = new WebSocket(`wss://proxy-free-attendance-system.onrender.com/ws/session/${code}`);
     wsRef.current.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -294,16 +300,24 @@ function ProfessorApp({ professor }) {
     };
   };
 
+  const fetchLiveToken = async () => {
+    try {
+      const res = await axios.get(`${API_URL}/session/token/${selectedSubject}`);
+      setCurrentToken(res.data.token);
+    } catch (err) {
+      console.error("Failed to fetch token", err);
+    }
+  };
+
   useEffect(() => {
     if (sessionActive) {
-      const generateToken = () => Math.random().toString(36).substring(2, 8).toUpperCase();
-      setCurrentToken(generateToken());
+      fetchLiveToken();
       setTimer(5);
 
       timerRef.current = setInterval(() => {
         setTimer(prev => {
           if (prev === 1) {
-            setCurrentToken(generateToken());
+            fetchLiveToken();
             return 5;
           }
           return prev - 1;
@@ -315,7 +329,7 @@ function ProfessorApp({ professor }) {
     }
 
     return () => clearInterval(timerRef.current);
-  }, [sessionActive]);
+  }, [sessionActive, selectedSubject]);
 
   const downloadExport = async () => {
     try {
@@ -323,7 +337,7 @@ function ProfessorApp({ professor }) {
       const url = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement('a');
       link.href = url;
-      link.setAttribute('download', `${selectedSubject}_attendance.csv`); // Using CSV opens natively in Excel
+      link.setAttribute('download', `${selectedSubject}_attendance.csv`);
       document.body.appendChild(link);
       link.click();
     } catch (err) {
@@ -331,7 +345,6 @@ function ProfessorApp({ professor }) {
     }
   };
 
-  // Generate real dynamic QR code URL based on current token
   const qrData = encodeURIComponent(`TRUSTATTENDANCE:${selectedSubject}:${currentToken}`);
   const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=256x256&data=${qrData}&margin=10`;
 
@@ -364,7 +377,7 @@ function ProfessorApp({ professor }) {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="md:col-span-2 bg-linear-to-br from-slate-900 to-slate-950 border border-slate-800 p-8 rounded-3xl shadow-2xl flex flex-col items-center justify-center relative overflow-hidden min-h-100">
+          <div className="md:col-span-2 bg-slate-900 border border-slate-800 p-8 rounded-3xl shadow-2xl flex flex-col items-center justify-center relative overflow-hidden min-h-100">
             <div className="absolute top-6 left-6 flex items-center gap-2 bg-indigo-500/10 border border-indigo-500/20 px-3.5 py-1.5 rounded-full text-xs font-bold text-indigo-300">
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
               {selectedSubject} Session Live
@@ -377,7 +390,6 @@ function ProfessorApp({ professor }) {
               End Session
             </button>
 
-            {/* Displaying Live Automatically Refreshing QR Code */}
             <div className="bg-white p-4 rounded-3xl mb-6 shadow-2xl border-4 border-slate-800 flex items-center justify-center">
               <img src={qrImageUrl} alt="Dynamic Session QR Code" className="w-48 h-48 object-contain" />
             </div>
@@ -427,7 +439,7 @@ function ProfessorApp({ professor }) {
 }
 
 // ==========================================
-// 3. STUDENT APP (Scanner UI with Auto-Submit)
+// 3. STUDENT APP (Offline + Signed Scanner)
 // ==========================================
 function StudentApp({ student }) {
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
@@ -435,7 +447,6 @@ function StudentApp({ student }) {
   const [statusMsg, setStatusMsg] = useState(null);
   const [isScanning, setIsScanning] = useState(false);
 
-  // We use a ref for isOffline to avoid stale closures in the scanner callback
   const isOfflineRef = useRef(isOffline);
   useEffect(() => {
     isOfflineRef.current = isOffline;
@@ -445,23 +456,30 @@ function StudentApp({ student }) {
     const handleOnlineStatus = async () => {
       const online = navigator.onLine;
       setIsOffline(!online);
+      
+      // Auto-sync when internet comes back
       if (online) {
         const queue = await getOfflineAttendance();
         if (queue.length > 0) {
+          setStatusMsg({ type: 'warning', text: `Syncing ${queue.length} offline records...` });
+          let successCount = 0;
           for (const item of queue) {
             try {
               await axios.post(`${API_URL}/attendance/verify`, {
                 subject_code: item.subjectCode,
                 student_id: item.studentId,
-                token: item.token
+                token: item.token,
+                timestamp: item.timestamp,
+                signature: item.signature
               });
+              successCount++;
             } catch (e) {
               console.error("Sync error", e);
             }
           }
           await clearOfflineQueue();
           setQueueCount(0);
-          setStatusMsg({ type: 'success', text: 'Offline attendance queue successfully synced to server!' });
+          setStatusMsg({ type: 'success', text: `Successfully synced ${successCount} offline records to server!` });
         }
       }
     };
@@ -481,32 +499,45 @@ function StudentApp({ student }) {
     setQueueCount(queue.length);
   };
 
-  // Submit Attendance directly once QR is scanned
+  // Submit Attendance with Cryptographic Offline Signatures
   const submitAttendance = async (subCode, token) => {
     if (!token || !subCode) {
       setStatusMsg({ type: 'error', text: 'Invalid QR Code format. Please scan a valid session QR.' });
       return;
     }
 
+    // Capture exact UTC scan time and create digital signature
+    const scanTimestamp = Date.now() / 1000.0;
+    const signature = await generateSignature(student.id, token, scanTimestamp);
+
     if (isOfflineRef.current) {
-      await saveOfflineAttendance({ subjectCode: subCode, studentId: student.id, token: token });
+      // Save full signed package locally
+      await saveOfflineAttendance({ 
+        subjectCode: subCode, 
+        studentId: student.id, 
+        token: token,
+        timestamp: scanTimestamp,
+        signature: signature
+      });
       await loadQueueCount();
-      setStatusMsg({ type: 'warning', text: `Offline mode: Attendance for ${subCode} cached locally.` });
+      setStatusMsg({ type: 'warning', text: `Offline mode: Synced locally. Timestamp: ${new Date().toLocaleTimeString()}` });
     } else {
+      // Send directly to backend
       try {
         await axios.post(`${API_URL}/attendance/verify`, {
           subject_code: subCode,
           student_id: student.id,
-          token: token
+          token: token,
+          timestamp: scanTimestamp,
+          signature: signature
         });
-        setStatusMsg({ type: 'success', text: `Attendance verified and saved to database for ${subCode}!` });
+        setStatusMsg({ type: 'success', text: `Attendance saved securely to database for ${subCode}!` });
       } catch (err) {
         setStatusMsg({ type: 'error', text: err.response?.data?.detail || 'Verification failed.' });
       }
     }
   };
 
-  // Dynamically load html5-qrcode script
   useEffect(() => {
     let scannerInstance = null;
     
@@ -521,28 +552,21 @@ function StudentApp({ student }) {
   
         scannerInstance.render(
           (decodedText) => {
-            // Stop scanning and clear the camera
             setIsScanning(false);
-            if (scannerInstance) {
-              scannerInstance.clear().catch(err => console.error(err));
-            }
+            if (scannerInstance) scannerInstance.clear().catch(err => console.error(err));
 
             let scannedSubject = '';
             let scannedToken = decodedText;
 
-            // Parse formatted TRUSTATTENDANCE:CS301:TOKEN
             if (decodedText.startsWith("TRUSTATTENDANCE:")) {
               const parts = decodedText.split(":");
               scannedSubject = parts[1];
               scannedToken = parts[2];
             }
             
-            // Automatically submit right after successful scan
             submitAttendance(scannedSubject, scannedToken);
           },
-          (errorMessage) => {
-            // scanning in progress (ignore frequent error messages)
-          }
+          (errorMessage) => { /* Ignore noisy scan errors */ }
         );
       };
 
@@ -581,13 +605,12 @@ function StudentApp({ student }) {
         <div className="bg-amber-500/10 border border-amber-500/20 p-4 rounded-2xl text-xs text-amber-300 flex items-start gap-3">
           <AlertCircle className="w-5 h-5 shrink-0 text-amber-400 mt-0.5" />
           <div>
-            <p className="font-bold">Pending Offline Queue ({queueCount})</p>
-            <p className="text-amber-300/80 mt-0.5">Will sync automatically when connection restores.</p>
+            <p className="font-bold">Pending Signed Queue ({queueCount})</p>
+            <p className="text-amber-300/80 mt-0.5">Scans are cryptographically signed. Will sync when Wi-Fi returns.</p>
           </div>
         </div>
       )}
 
-      {/* QR Code Scanner View */}
       {isScanning ? (
         <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 relative">
           <div className="flex justify-between items-center mb-3">
@@ -597,7 +620,7 @@ function StudentApp({ student }) {
             </button>
           </div>
           <div id="reader" className="overflow-hidden rounded-xl bg-black"></div>
-          <p className="text-xs text-slate-400 text-center mt-3">Attendance will automatically submit on successful scan.</p>
+          <p className="text-xs text-slate-400 text-center mt-3">Attendance will be automatically signed & submitted.</p>
         </div>
       ) : (
         <div className="space-y-4">
@@ -636,10 +659,17 @@ function LoginSelection({ onLoginSuccess }) {
     e.preventDefault();
     setLoading(true);
     try {
-      const res = await axios.post(`${API_URL}/auth/login`, { email, password });
+      // Clean up mobile keyboard auto-capitalization and trailing spaces
+      const cleanEmail = email.trim().toLowerCase();
+      const res = await axios.post(`${API_URL}/auth/login`, { email: cleanEmail, password: password.trim() });
       onLoginSuccess(res.data);
     } catch (err) {
-      alert(err.response?.data?.detail || "Invalid credentials. Check email or password.");
+      // Differentiate between real credential errors and network/CORS blocks
+      if (!err.response) {
+        alert("Network Error: Could not connect to backend. Wait for Render to update or check internet.");
+      } else {
+        alert(err.response?.data?.detail || "Invalid credentials. Check email or password.");
+      }
     } finally {
       setLoading(false);
     }
@@ -651,7 +681,7 @@ function LoginSelection({ onLoginSuccess }) {
         <div className="absolute top-0 right-0 -mt-16 -mr-16 w-64 h-64 bg-indigo-600/10 rounded-full blur-3xl pointer-events-none"></div>
         
         <div className="flex justify-center">
-          <div className="w-20 h-20 bg-linear-to-tr from-indigo-600 to-violet-500 rounded-3xl flex items-center justify-center rotate-3 shadow-xl shadow-indigo-600/30 border border-indigo-400/20">
+          <div className="w-20 h-20 bg-indigo-600 rounded-3xl flex items-center justify-center rotate-3 shadow-xl shadow-indigo-600/30 border border-indigo-400/20">
             <ShieldCheck className="w-10 h-10 text-white" />
           </div>
         </div>
@@ -665,11 +695,14 @@ function LoginSelection({ onLoginSuccess }) {
           <div>
             <label className="block text-xs font-bold text-slate-300 mb-1.5 uppercase tracking-wider">Email / Username</label>
             <input 
-              type="text" 
+              type="email" 
               value={email} 
               onChange={e => setEmail(e.target.value)}
               placeholder="admin@college.edu or student ID"
               required
+              autoCapitalize="none"
+              autoCorrect="off"
+              spellCheck="false"
               className="w-full p-3.5 bg-slate-950 border border-slate-800 rounded-2xl text-sm text-white outline-none focus:border-indigo-500"
             />
           </div>
@@ -682,6 +715,8 @@ function LoginSelection({ onLoginSuccess }) {
               onChange={e => setPassword(e.target.value)}
               placeholder="••••••••"
               required
+              autoCapitalize="none"
+              autoCorrect="off"
               className="w-full p-3.5 bg-slate-950 border border-slate-800 rounded-2xl text-sm text-white outline-none focus:border-indigo-500"
             />
           </div>
