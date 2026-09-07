@@ -4,6 +4,8 @@ import io
 import pyotp
 import json
 import bcrypt
+import hashlib
+from datetime import datetime, timezone
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,7 +25,6 @@ app.add_middleware(
         "http://localhost:5173",
         "https://localhost:5173",
         "http://127.0.0.1:5173",
-        # Add your live frontend URL here once you deploy it (e.g., Vercel/Netlify):
         "https://your-frontend-app-name.vercel.app" 
     ],
     allow_credentials=True,
@@ -80,23 +81,22 @@ class AttendanceVerify(BaseModel):
     subject_code: str
     student_id: int
     token: str
+    timestamp: float = None  # Unix timestamp from the device
+    signature: str = None    # SHA-256 hash proof
 
 # ==========================================
 # AUTHENTICATION
 # ==========================================
 @app.post("/auth/login")
 def login(credentials: LoginRequest, db: Session = Depends(get_db)):
-    # 1. Check if it's the Admin logging in via .env credentials
     if credentials.email == os.getenv("ADMIN_EMAIL") and credentials.password == os.getenv("ADMIN_PASSWORD"):
         return {"id": 0, "role": "admin", "name": "System Admin", "email": credentials.email}
     
-    # 2. Check Database for Professors or Students
     user = db.query(models.User).filter(models.User.email == credentials.email).first()
     if not user:
         raise HTTPException(status_code=401, detail="Invalid email or password.")
         
     try:
-        # Prevent bcrypt 72-byte limit crashes by truncating the input to 72 bytes
         password_bytes = credentials.password.encode('utf-8')[:72]
         if not bcrypt.checkpw(password_bytes, user.hashed_password.encode('utf-8')):
             raise HTTPException(status_code=401, detail="Invalid email or password.")
@@ -119,7 +119,6 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
     
-    # Directly use bcrypt to hash the password (avoid passlib incompatibility with modern bcrypt)
     password_bytes = user.password.encode('utf-8')[:72]
     hashed_pwd = bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode('utf-8')
     
@@ -178,27 +177,39 @@ async def verify_attendance(data: AttendanceVerify, db: Session = Depends(get_db
     secret = redis_db.hget(session_key, "secret")
     totp = pyotp.TOTP(secret, interval=5)
     
-    if not totp.verify(data.token, valid_window=1):
-        raise HTTPException(status_code=401, detail="Invalid token. Proxies denied.")
+    clean_token = data.token.strip().upper()
+    if ":" in clean_token:
+        clean_token = clean_token.split(":")[-1]
+    
+    # 1. Digital Signature & Offline Timestamp Verification
+    client_time = datetime.now()
+    if data.timestamp and data.signature:
+        # Recreate the hash to prove the timestamp wasn't altered
+        expected_sig = hashlib.sha256(f"{data.student_id}:{clean_token}:{data.timestamp}".encode()).hexdigest()
+        if expected_sig != data.signature:
+            raise HTTPException(status_code=403, detail="Invalid digital signature. Anti-tamper triggered.")
+        client_time = datetime.fromtimestamp(data.timestamp)
+
+    # 2. Time-Machine Token Check (Verify token was valid at exact time of scan)
+    if not totp.verify(clean_token, valid_window=4, for_time=client_time):
+        raise HTTPException(status_code=401, detail="Invalid or expired token. Proxies denied.")
         
-    # Get subject ID from DB
     subject = db.query(models.Subject).filter(models.Subject.code == data.subject_code).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Subject not found")
 
-    # Prevent double scanning
     existing_log = db.query(models.AttendanceLog).filter(
         models.AttendanceLog.student_id == data.student_id,
         models.AttendanceLog.subject_id == subject.id,
-        models.AttendanceLog.token_used == data.token
+        models.AttendanceLog.token_used == clean_token
     ).first()
 
     if not existing_log:
-        db_log = models.AttendanceLog(student_id=data.student_id, subject_id=subject.id, token_used=data.token)
+        # Store with the exact timestamp the offline scan happened
+        db_log = models.AttendanceLog(student_id=data.student_id, subject_id=subject.id, token_used=clean_token, timestamp=client_time)
         db.add(db_log)
         db.commit()
     
-    # WebSocket Broadcast
     await manager.broadcast(data.subject_code, {
         "type": "NEW_ATTENDANCE",
         "student_id": data.student_id
@@ -216,16 +227,15 @@ def export_attendance(subject_code: str, db: Session = Depends(get_db)):
 
     logs = db.query(models.AttendanceLog).filter(models.AttendanceLog.subject_id == subject.id).all()
     
-    # Create CSV in memory
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Student ID", "Student Name", "Timestamp", "Token Used", "Status"])
+    writer.writerow(["Student ID", "Student Name", "Timestamp", "Token Used", "Status", "Scan Type"])
     
     for log in logs:
-        # Get student name
         student = db.query(models.User).filter(models.User.id == log.student_id).first()
         student_name = student.name if student else "Unknown"
-        writer.writerow([log.student_id, student_name, log.timestamp.strftime("%Y-%m-%d %H:%M:%S"), log.token_used, log.status])
+        scan_type = "Offline Synced" if log.status == "verified" else "Live"
+        writer.writerow([log.student_id, student_name, log.timestamp.strftime("%Y-%m-%d %H:%M:%S"), log.token_used, log.status, scan_type])
     
     output.seek(0)
     
