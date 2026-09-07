@@ -19,7 +19,13 @@ app = FastAPI(title="TrustAttendance API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "https://localhost:5173",
+        "http://127.0.0.1:5173",
+        # Add your live frontend URL here once you deploy it (e.g., Vercel/Netlify):
+        "https://your-frontend-app-name.vercel.app" 
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -152,6 +158,15 @@ def start_session(data: SessionStart):
     redis_db.expire(session_key, 7200)
     
     return {"message": "Session started", "secret": totp_secret}
+
+@app.get("/session/token/{subject_code}")
+def get_current_token(subject_code: str):
+    session_key = f"session:{subject_code}"
+    if not redis_db.exists(session_key):
+        raise HTTPException(status_code=404, detail="No active session found.")
+    secret = redis_db.hget(session_key, "secret")
+    totp = pyotp.TOTP(secret, interval=5)
+    return {"token": totp.now()}
 
 @app.post("/attendance/verify")
 async def verify_attendance(data: AttendanceVerify, db: Session = Depends(get_db)):

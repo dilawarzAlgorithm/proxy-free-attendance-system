@@ -284,6 +284,7 @@ function ProfessorApp({ professor }) {
   };
 
   const connectWebSocket = (code) => {
+    // Connect to the Render deployed WebSocket backend securely via wss://
     wsRef.current = new WebSocket(`wss://proxy-free-attendance-system.onrender.com/ws/session/${code}`);
     wsRef.current.onmessage = (event) => {
       const data = JSON.parse(event.data);
@@ -330,6 +331,10 @@ function ProfessorApp({ professor }) {
     }
   };
 
+  // Generate real dynamic QR code URL based on current token
+  const qrData = encodeURIComponent(`TRUSTATTENDANCE:${selectedSubject}:${currentToken}`);
+  const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=256x256&data=${qrData}&margin=10`;
+
   return (
     <div className="max-w-4xl mx-auto space-y-6">
       {!sessionActive ? (
@@ -372,8 +377,9 @@ function ProfessorApp({ professor }) {
               End Session
             </button>
 
-            <div className="bg-white p-6 rounded-3xl mb-6 shadow-2xl border-4 border-slate-800">
-              <QrCode className="w-48 h-48 text-slate-950" />
+            {/* Displaying Live Automatically Refreshing QR Code */}
+            <div className="bg-white p-4 rounded-3xl mb-6 shadow-2xl border-4 border-slate-800 flex items-center justify-center">
+              <img src={qrImageUrl} alt="Dynamic Session QR Code" className="w-48 h-48 object-contain" />
             </div>
 
             <div className="text-center">
@@ -421,22 +427,19 @@ function ProfessorApp({ professor }) {
 }
 
 // ==========================================
-// 3. STUDENT APP (Scanner UI Added)
+// 3. STUDENT APP (Scanner UI with Auto-Submit)
 // ==========================================
 function StudentApp({ student }) {
-  const [subjectCode, setSubjectCode] = useState('');
-  const [tokenInput, setTokenInput] = useState('');
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
   const [queueCount, setQueueCount] = useState(0);
   const [statusMsg, setStatusMsg] = useState(null);
   const [isScanning, setIsScanning] = useState(false);
 
+  // We use a ref for isOffline to avoid stale closures in the scanner callback
+  const isOfflineRef = useRef(isOffline);
   useEffect(() => {
-    // Attempt to pre-fetch subjects to populate the dropdown
-    axios.get(`${API_URL}/admin/subjects`).then(res => {
-      if (res.data.length > 0) setSubjectCode(res.data[0].code);
-    }).catch(err => console.error(err));
-  }, []);
+    isOfflineRef.current = isOffline;
+  }, [isOffline]);
 
   useEffect(() => {
     const handleOnlineStatus = async () => {
@@ -473,7 +476,37 @@ function StudentApp({ student }) {
     };
   }, []);
 
-  // Dynamically load html5-qrcode script to avoid bundler resolution issues in Canvas
+  const loadQueueCount = async () => {
+    const queue = await getOfflineAttendance();
+    setQueueCount(queue.length);
+  };
+
+  // Submit Attendance directly once QR is scanned
+  const submitAttendance = async (subCode, token) => {
+    if (!token || !subCode) {
+      setStatusMsg({ type: 'error', text: 'Invalid QR Code format. Please scan a valid session QR.' });
+      return;
+    }
+
+    if (isOfflineRef.current) {
+      await saveOfflineAttendance({ subjectCode: subCode, studentId: student.id, token: token });
+      await loadQueueCount();
+      setStatusMsg({ type: 'warning', text: `Offline mode: Attendance for ${subCode} cached locally.` });
+    } else {
+      try {
+        await axios.post(`${API_URL}/attendance/verify`, {
+          subject_code: subCode,
+          student_id: student.id,
+          token: token
+        });
+        setStatusMsg({ type: 'success', text: `Attendance verified and saved to database for ${subCode}!` });
+      } catch (err) {
+        setStatusMsg({ type: 'error', text: err.response?.data?.detail || 'Verification failed.' });
+      }
+    }
+  };
+
+  // Dynamically load html5-qrcode script
   useEffect(() => {
     let scannerInstance = null;
     
@@ -488,12 +521,27 @@ function StudentApp({ student }) {
   
         scannerInstance.render(
           (decodedText) => {
-            setTokenInput(decodedText);
+            // Stop scanning and clear the camera
             setIsScanning(false);
-            scannerInstance.clear().catch(err => console.error(err));
+            if (scannerInstance) {
+              scannerInstance.clear().catch(err => console.error(err));
+            }
+
+            let scannedSubject = '';
+            let scannedToken = decodedText;
+
+            // Parse formatted TRUSTATTENDANCE:CS301:TOKEN
+            if (decodedText.startsWith("TRUSTATTENDANCE:")) {
+              const parts = decodedText.split(":");
+              scannedSubject = parts[1];
+              scannedToken = parts[2];
+            }
+            
+            // Automatically submit right after successful scan
+            submitAttendance(scannedSubject, scannedToken);
           },
           (errorMessage) => {
-            // scanning in progress...
+            // scanning in progress (ignore frequent error messages)
           }
         );
       };
@@ -513,35 +561,6 @@ function StudentApp({ student }) {
       if (scannerInstance) scannerInstance.clear().catch(e => console.error(e));
     };
   }, [isScanning]);
-
-  const loadQueueCount = async () => {
-    const queue = await getOfflineAttendance();
-    setQueueCount(queue.length);
-  };
-
-  const handleScanSubmit = async (e) => {
-    e.preventDefault();
-    if (!tokenInput || !subjectCode) return;
-
-    if (isOffline) {
-      await saveOfflineAttendance({ subjectCode, studentId: student.id, token: tokenInput });
-      await loadQueueCount();
-      setStatusMsg({ type: 'warning', text: 'Offline mode: Attendance cached locally in IndexedDB.' });
-      setTokenInput('');
-    } else {
-      try {
-        await axios.post(`${API_URL}/attendance/verify`, {
-          subject_code: subjectCode,
-          student_id: student.id,
-          token: tokenInput
-        });
-        setStatusMsg({ type: 'success', text: 'Attendance verified and saved to database!' });
-        setTokenInput('');
-      } catch (err) {
-        setStatusMsg({ type: 'error', text: err.response?.data?.detail || 'Verification failed.' });
-      }
-    }
-  };
 
   return (
     <div className="max-w-md mx-auto bg-slate-900/60 backdrop-blur-xl border border-slate-800 rounded-3xl shadow-2xl overflow-hidden p-8 space-y-6">
@@ -572,61 +591,33 @@ function StudentApp({ student }) {
       {isScanning ? (
         <div className="bg-slate-950 p-4 rounded-2xl border border-slate-800 relative">
           <div className="flex justify-between items-center mb-3">
-            <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">Scan QR Code</span>
+            <span className="text-xs font-bold text-slate-300 uppercase tracking-wider">Scan Professor's QR Code</span>
             <button onClick={() => setIsScanning(false)} className="text-slate-400 hover:text-white p-1">
               <X className="w-5 h-5" />
             </button>
           </div>
           <div id="reader" className="overflow-hidden rounded-xl bg-black"></div>
+          <p className="text-xs text-slate-400 text-center mt-3">Attendance will automatically submit on successful scan.</p>
         </div>
       ) : (
-        <button 
-          onClick={() => setIsScanning(true)}
-          className="w-full py-4 bg-indigo-500/10 border-2 border-dashed border-indigo-500/30 hover:border-indigo-500 text-indigo-300 hover:text-indigo-200 rounded-2xl font-bold text-sm transition-all flex items-center justify-center gap-2"
-        >
-          <Camera className="w-5 h-5" /> Open Camera Scanner
-        </button>
+        <div className="space-y-4">
+          <button 
+            onClick={() => { setStatusMsg(null); setIsScanning(true); }}
+            className="w-full py-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-2xl font-bold text-sm shadow-lg shadow-indigo-600/30 transition-all flex items-center justify-center gap-2 active:scale-95"
+          >
+            <Camera className="w-5 h-5" /> Tap to Scan & Submit
+          </button>
+        </div>
       )}
 
-      <form onSubmit={handleScanSubmit} className="space-y-4">
-        <div>
-          <label className="block text-xs font-bold text-slate-300 mb-1.5 uppercase tracking-wider">Subject Code</label>
-          <input 
-            type="text" 
-            value={subjectCode} 
-            onChange={e => setSubjectCode(e.target.value)}
-            className="w-full p-3.5 bg-slate-950 border border-slate-800 rounded-2xl uppercase font-mono text-sm text-white font-bold outline-none focus:border-indigo-500"
-            placeholder="e.g. CS301"
-          />
-        </div>
-
-        <div>
-          <label className="block text-xs font-bold text-slate-300 mb-1.5 uppercase tracking-wider">TOTP Token</label>
-          <input 
-            type="text" 
-            value={tokenInput} 
-            onChange={e => setTokenInput(e.target.value)}
-            placeholder="Scanned automatically from QR"
-            className="w-full p-3.5 bg-slate-950 border border-slate-800 rounded-2xl uppercase font-mono text-sm text-white font-bold outline-none focus:border-indigo-500"
-          />
-        </div>
-
-        <button 
-          type="submit"
-          className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-4 rounded-2xl font-bold text-sm shadow-lg shadow-indigo-600/30 transition-all"
-        >
-          Submit Attendance Token
-        </button>
-      </form>
-
       {statusMsg && (
-        <div className={`p-4 rounded-2xl text-xs flex items-start gap-3 border ${
+        <div className={`p-4 rounded-2xl text-xs flex items-start gap-3 border animate-in zoom-in duration-300 ${
           statusMsg.type === 'success' ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20' :
           statusMsg.type === 'warning' ? 'bg-amber-500/10 text-amber-300 border-amber-500/20' : 
           'bg-rose-500/10 text-rose-300 border-rose-500/20'
         }`}>
-          {statusMsg.type === 'success' ? <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" /> : <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />}
-          <span className="leading-relaxed">{statusMsg.text}</span>
+          {statusMsg.type === 'success' ? <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0 mt-0.5" /> : <AlertCircle className="w-5 h-5 shrink-0 mt-0.5" />}
+          <span className="leading-relaxed text-sm font-medium">{statusMsg.text}</span>
         </div>
       )}
     </div>
