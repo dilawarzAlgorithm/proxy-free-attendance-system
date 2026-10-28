@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from database import engine, Base, get_db
 from redis_client import redis_db
 import models
+import face_recognition_service
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from fpdf import FPDF
@@ -95,6 +96,7 @@ class AttendanceVerify(BaseModel):
     timestamp: Optional[float] = None  # Unix timestamp from the device
     signature: Optional[str] = None    # SHA-256 hash proof
     hardware_id: Optional[str] = None  # WebAuthn Hardware Device ID
+    image_b64: Optional[str] = None    # Camera frame Base64 for face verification
 
 # ==========================================
 # AUTHENTICATION & DEVICE BINDING
@@ -294,7 +296,7 @@ async def verify_attendance(data: AttendanceVerify, db: Session = Depends(get_db
     secret = redis_db.hget(session_key, "secret")
     totp = pyotp.TOTP(secret, interval=5)
     
-    clean_token = data.token.strip().upper()
+    clean_token = data.token.strip().replace(" ", "").upper()
     if ":" in clean_token:
         clean_token = clean_token.split(":")[-1]
     
@@ -307,7 +309,9 @@ async def verify_attendance(data: AttendanceVerify, db: Session = Depends(get_db
         client_time = datetime.fromtimestamp(data.timestamp)
 
     # 2. Time-Machine Token Check (Verify token was valid at exact time of scan)
-    if not totp.verify(clean_token, valid_window=4, for_time=client_time):
+    # Allow 60-second window (12 * 5s) to comfortably accommodate front camera selfie verification
+    is_valid_token = totp.verify(clean_token, valid_window=12, for_time=client_time) or totp.verify(clean_token, valid_window=12)
+    if not is_valid_token:
         raise HTTPException(status_code=401, detail="Invalid or expired token. Proxies denied.")
         
     subject = db.query(models.Subject).filter(models.Subject.code == data.subject_code).first()
@@ -366,12 +370,63 @@ async def verify_attendance(data: AttendanceVerify, db: Session = Depends(get_db
                 detail="Duplicate attendance detected for this lecture timeframe."
             )
 
+    # 5. Facial Verification & Proxy Detection
+    if not data.image_b64:
+        raise HTTPException(status_code=400, detail="No face detected in camera frame. Live camera capture is required.")
+
+    try:
+        face_data = face_recognition_service.process_face_image(data.image_b64)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Face processing error: {str(e)}")
+
+    embedding = face_data.get("embedding")
+    thumb_b64 = face_data.get("thumbnail_b64")
+    is_flagged_proxy = False
+    proxy_match = None
+
+    if target_session_id and embedding:
+        proxy_match = face_recognition_service.check_proxy_attempt(
+            new_embedding=embedding,
+            session_id=target_session_id,
+            student_id=data.student_id,
+            threshold=0.68
+        )
+        if proxy_match.get("is_proxy"):
+            is_flagged_proxy = True
+            matched_id = proxy_match.get("matched_student_id")
+            if matched_id:
+                prev_log = db.query(models.AttendanceLog).filter(
+                    models.AttendanceLog.session_id == target_session_id,
+                    models.AttendanceLog.student_id == matched_id
+                ).first()
+                if prev_log:
+                    prev_log.status = "flagged_proxy"
+                    db.commit()
+
+    status_val = "flagged_proxy" if is_flagged_proxy else "verified"
+
+    if target_session_id and embedding:
+        face_recognition_service.save_face_record(
+            session_id=target_session_id,
+            student_id=data.student_id,
+            student_name=student.name,
+            embedding=embedding,
+            thumbnail_b64=thumb_b64,
+            is_flagged_proxy=is_flagged_proxy,
+            matched_with_id=proxy_match.get("matched_student_id") if proxy_match else None,
+            matched_with_name=proxy_match.get("matched_student_name") if proxy_match else None,
+            similarity=proxy_match.get("similarity") if proxy_match else None
+        )
+
     db_log = models.AttendanceLog(
         student_id=data.student_id, 
         subject_id=subject.id, 
         session_id=target_session_id,
         token_used=clean_token, 
-        timestamp=client_time
+        timestamp=client_time,
+        status=status_val
     )
     db.add(db_log)
     db.commit()
@@ -379,9 +434,27 @@ async def verify_attendance(data: AttendanceVerify, db: Session = Depends(get_db
     await manager.broadcast(data.subject_code, {
         "type": "NEW_ATTENDANCE",
         "student_id": data.student_id,
-        "student_name": student.name
+        "student_name": student.name,
+        "status": status_val,
+        "is_flagged_proxy": is_flagged_proxy,
+        "photo": thumb_b64,
+        "matched_with_id": proxy_match.get("matched_student_id") if proxy_match else None,
+        "matched_with_name": proxy_match.get("matched_student_name") if proxy_match else None,
+        "similarity": proxy_match.get("similarity") if proxy_match else None
     })
-    return {"status": "success", "message": "Attendance marked successfully."}
+
+    if is_flagged_proxy:
+        return {
+            "status": "flagged_proxy",
+            "is_flagged_proxy": True,
+            "message": "Warning: Facial proxy detected! Flagged for professor review."
+        }
+
+    return {
+        "status": "success",
+        "is_flagged_proxy": False,
+        "message": "Attendance marked successfully. Face verified."
+    }
 
 # ==========================================
 # PROFESSOR RECENT SESSIONS (LAST 2 SESSIONS)
@@ -400,6 +473,10 @@ def get_recent_sessions(subject_code: str, db: Session = Depends(get_db)):
     results = []
     for s in sessions:
         count = db.query(models.AttendanceLog).filter(models.AttendanceLog.session_id == s.id).count()
+        proxy_count = db.query(models.AttendanceLog).filter(
+            models.AttendanceLog.session_id == s.id,
+            models.AttendanceLog.status.in_(["flagged_proxy", "confirmed_proxy"])
+        ).count()
         results.append({
             "id": s.id,
             "subject_code": subject.code,
@@ -407,9 +484,88 @@ def get_recent_sessions(subject_code: str, db: Session = Depends(get_db)):
             "start_time": s.start_time.strftime("%Y-%m-%d %H:%M:%S") if s.start_time else "N/A",
             "end_time": s.end_time.strftime("%Y-%m-%d %H:%M:%S") if s.end_time else None,
             "is_active": s.is_active,
-            "student_count": count
+            "student_count": count,
+            "proxy_count": proxy_count
         })
     return results
+
+# ==========================================
+# PROFESSOR PROXY AUDIT & FACE VIEWER
+# ==========================================
+@app.get("/professor/session/{session_id}/faces")
+def get_session_faces(session_id: int, db: Session = Depends(get_db)):
+    sess = db.query(models.ClassSession).filter(models.ClassSession.id == session_id).first()
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    face_records = face_recognition_service.get_session_face_records(session_id)
+    face_map = {r["student_id"]: r for r in face_records}
+
+    logs = db.query(models.AttendanceLog).filter(models.AttendanceLog.session_id == session_id).all()
+    results = []
+    for log in logs:
+        student = log.student
+        rec = face_map.get(log.student_id, {})
+        results.append({
+            "log_id": log.id,
+            "student_id": log.student_id,
+            "student_name": student.name if student else "Unknown",
+            "email": student.email if student else "N/A",
+            "timestamp": log.timestamp.strftime("%Y-%m-%d %H:%M:%S") if log.timestamp else "N/A",
+            "status": log.status,
+            "is_flagged_proxy": log.status in ["flagged_proxy", "confirmed_proxy"],
+            "photo": rec.get("photo"),
+            "matched_with_id": rec.get("matched_with_id"),
+            "matched_with_name": rec.get("matched_with_name"),
+            "similarity": rec.get("similarity")
+        })
+    return results
+
+@app.post("/professor/dismiss-proxy/{session_id}/{student_id}")
+async def dismiss_proxy(session_id: int, student_id: int, db: Session = Depends(get_db)):
+    log = db.query(models.AttendanceLog).filter(
+        models.AttendanceLog.session_id == session_id,
+        models.AttendanceLog.student_id == student_id
+    ).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Attendance log not found")
+    
+    log.status = "verified"
+    db.commit()
+    face_recognition_service.update_proxy_status(session_id, student_id, False, "verified")
+
+    if log.session and log.session.subject:
+        await manager.broadcast(log.session.subject.code, {
+            "type": "PROXY_STATUS_UPDATED",
+            "student_id": student_id,
+            "session_id": session_id,
+            "status": "verified",
+            "is_flagged_proxy": False
+        })
+    return {"status": "success", "message": "Proxy flag dismissed. Attendance marked verified."}
+
+@app.post("/professor/confirm-proxy/{session_id}/{student_id}")
+async def confirm_proxy(session_id: int, student_id: int, db: Session = Depends(get_db)):
+    log = db.query(models.AttendanceLog).filter(
+        models.AttendanceLog.session_id == session_id,
+        models.AttendanceLog.student_id == student_id
+    ).first()
+    if not log:
+        raise HTTPException(status_code=404, detail="Attendance log not found")
+    
+    log.status = "confirmed_proxy"
+    db.commit()
+    face_recognition_service.update_proxy_status(session_id, student_id, True, "confirmed_proxy")
+
+    if log.session and log.session.subject:
+        await manager.broadcast(log.session.subject.code, {
+            "type": "PROXY_STATUS_UPDATED",
+            "student_id": student_id,
+            "session_id": session_id,
+            "status": "confirmed_proxy",
+            "is_flagged_proxy": True
+        })
+    return {"status": "success", "message": "Proxy attendance confirmed and flagged."}
 
 # ==========================================
 # MULTI-FORMAT EXPORT ENGINE (CSV / EXCEL / PDF)
@@ -460,7 +616,7 @@ def build_export_response(logs: list, subject_code: str, subject_name: str, form
         ws.append([]) # row 3 blank
 
         # Table headers
-        headers = ["#", "Student ID", "Student Name", "Email", "Timestamp", "Device Binding"]
+        headers = ["#", "Student ID", "Student Name", "Email", "Timestamp", "Status", "Device Binding"]
         ws.append(headers)
         ws.row_dimensions[4].height = 22
         for col_idx in range(1, len(headers) + 1):
@@ -479,22 +635,26 @@ def build_export_response(logs: list, subject_code: str, subject_name: str, form
         for idx, log in enumerate(logs, start=1):
             student = log.student
             time_str = log.timestamp.strftime("%Y-%m-%d %H:%M:%S") if log.timestamp else "N/A"
+            status_display = "Verified" if log.status == "verified" else ("Proxy Flagged" if log.status == "flagged_proxy" else "Proxy Confirmed")
             row_data = [
                 idx,
                 log.student_id,
                 student.name if student else "Unknown",
                 student.email if student else "N/A",
                 time_str,
+                status_display,
                 "Bound 1:1 (WebAuthn)" if (student and student.hardware_id) else "Unbound"
             ]
             ws.append(row_data)
             row_num = ws.max_row
-            fill_color = "F8FAFC" if idx % 2 == 0 else "FFFFFF"
+            fill_color = "FEF2F2" if log.status in ["flagged_proxy", "confirmed_proxy"] else ("F8FAFC" if idx % 2 == 0 else "FFFFFF")
             for col_idx in range(1, len(headers) + 1):
                 c = ws.cell(row=row_num, column=col_idx)
                 c.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
                 c.border = thin_border
-                c.alignment = Alignment(horizontal="center" if col_idx in [1, 2, 5, 6] else "left", vertical="center")
+                c.alignment = Alignment(horizontal="center" if col_idx in [1, 2, 5, 6, 7] else "left", vertical="center")
+                if log.status in ["flagged_proxy", "confirmed_proxy"] and col_idx == 6:
+                    c.font = Font(color="DC2626", bold=True)
 
         for col in ws.columns:
             max_len = max(len(str(cell.value or '')) for cell in col)
@@ -525,12 +685,12 @@ def build_export_response(logs: list, subject_code: str, subject_name: str, form
         pdf.set_xy(14, 32)
         pdf.set_font('Helvetica', '', 9)
         pdf.set_text_color(71, 85, 105)
-        pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}   |   Total Students Present: {len(logs)}", new_x='LMARGIN', new_y='NEXT')
+        pdf.cell(0, 6, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}   |   Total Students: {len(logs)}", new_x='LMARGIN', new_y='NEXT')
         pdf.ln(8)
 
         # Table Headers
-        col_widths = [10, 22, 50, 54, 32, 22]
-        headers = ['#', 'ID', 'Student Name', 'Email', 'Timestamp', 'Hardware']
+        col_widths = [8, 16, 42, 46, 26, 30, 22]
+        headers = ['#', 'ID', 'Student Name', 'Email', 'Timestamp', 'Status', 'Hardware']
         pdf.set_fill_color(79, 70, 229)
         pdf.set_text_color(255, 255, 255)
         pdf.set_font('Helvetica', 'B', 9)
@@ -544,21 +704,28 @@ def build_export_response(logs: list, subject_code: str, subject_name: str, form
             student = log.student
             time_str = log.timestamp.strftime("%H:%M:%S") if log.timestamp else "N/A"
             binding_str = "Bound" if (student and student.hardware_id) else "Unbound"
+            status_str = "Verified" if log.status == "verified" else ("FLAGGED PROXY" if log.status == "flagged_proxy" else "CONFIRMED PROXY")
             
-            fill_color = 248 if idx % 2 == 0 else 255
-            pdf.set_fill_color(fill_color, fill_color, fill_color)
-            pdf.set_text_color(15, 23, 42)
+            is_proxy = log.status in ["flagged_proxy", "confirmed_proxy"]
+            if is_proxy:
+                pdf.set_fill_color(254, 226, 226) # light red
+                pdf.set_text_color(185, 28, 28)
+            else:
+                fill_color = 248 if idx % 2 == 0 else 255
+                pdf.set_fill_color(fill_color, fill_color, fill_color)
+                pdf.set_text_color(15, 23, 42)
             
             row = [
                 str(idx),
                 str(log.student_id),
-                (student.name[:24] if student else "Unknown"),
-                (student.email[:26] if student else "N/A"),
+                (student.name[:20] if student else "Unknown"),
+                (student.email[:22] if student else "N/A"),
                 time_str,
+                status_str,
                 binding_str
             ]
             for w, val, col_i in zip(col_widths, row, range(len(row))):
-                align = 'C' if col_i in [0, 1, 4, 5] else 'L'
+                align = 'C' if col_i in [0, 1, 4, 5, 6] else 'L'
                 pdf.cell(w, 7, val, border=1, fill=True, align=align)
             pdf.ln()
 
