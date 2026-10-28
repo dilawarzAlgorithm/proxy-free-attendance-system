@@ -20,12 +20,26 @@ class Subject(Base):
     name = Column(String)
     code = Column(String, unique=True, index=True) # e.g., 'CS301'
 
+class ClassSession(Base):
+    __tablename__ = "class_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id"))
+    professor_id = Column(Integer, ForeignKey("users.id"))
+    start_time = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    end_time = Column(DateTime, nullable=True)
+    is_active = Column(Integer, default=1)
+
+    subject = relationship("Subject")
+    professor = relationship("User")
+
 class AttendanceLog(Base):
     __tablename__ = "attendance_logs"
     
     id = Column(Integer, primary_key=True, index=True)
     student_id = Column(Integer, ForeignKey("users.id"))
     subject_id = Column(Integer, ForeignKey("subjects.id"))
+    session_id = Column(Integer, ForeignKey("class_sessions.id"), nullable=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     token_used = Column(String)
     status = Column(String, default="verified")
@@ -33,3 +47,4 @@ class AttendanceLog(Base):
     # Relationships to easily query associated data
     student = relationship("User")
     subject = relationship("Subject")
+    session = relationship("ClassSession")
