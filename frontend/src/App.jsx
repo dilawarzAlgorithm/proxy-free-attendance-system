@@ -43,9 +43,20 @@ async function clearOfflineQueue() {
   await tx.done;
 }
 
+async function deleteOfflineRecord(id) {
+  if (!id) return;
+  const db = await initDB();
+  const tx = db.transaction(STORE_NAME, 'readwrite');
+  await tx.objectStore(STORE_NAME).delete(id);
+  await tx.done;
+}
+
 // Security: Generate a SHA-256 hash locally in the browser to sign offline requests
 async function generateSignature(studentId, token, timestamp) {
-  const msgUint8 = new TextEncoder().encode(`${studentId}:${token}:${timestamp}`);
+  const cleanToken = String(token || '').trim().replace(/\s+/g, '').toUpperCase();
+  const tokenFinal = cleanToken.includes(':') ? cleanToken.split(':').pop() : cleanToken;
+  const tsFinal = Math.floor(Number(timestamp));
+  const msgUint8 = new TextEncoder().encode(`${studentId}:${tokenFinal}:${tsFinal}`);
   const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
@@ -77,9 +88,27 @@ async function downloadFileFromEndpoint(url, fallbackFilename) {
 // ROOT APP
 // ==========================================
 export default function App() {
-  const [currentUser, setCurrentUser] = useState(null);
+  const [currentUser, setCurrentUser] = useState(() => {
+    try {
+      const saved = localStorage.getItem('trustattendance_user');
+      return saved ? JSON.parse(saved) : null;
+    } catch (e) {
+      return null;
+    }
+  });
   const [deferredPrompt, setDeferredPrompt] = useState(null);
   const [isPwaInstalled, setIsPwaInstalled] = useState(false);
+
+  useEffect(() => {
+    if (currentUser) {
+      localStorage.setItem('trustattendance_user', JSON.stringify(currentUser));
+      if (currentUser.id && currentUser.hardware_id) {
+        localStorage.setItem(`bound_device_${currentUser.id}`, currentUser.hardware_id);
+      }
+    } else {
+      localStorage.removeItem('trustattendance_user');
+    }
+  }, [currentUser]);
 
   useEffect(() => {
     const handleBeforeInstall = (e) => {
@@ -106,6 +135,11 @@ export default function App() {
       setIsPwaInstalled(true);
     }
     setDeferredPrompt(null);
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('trustattendance_user');
+    setCurrentUser(null);
   };
 
   if (!currentUser) {
@@ -141,7 +175,7 @@ export default function App() {
           </div>
 
           <button 
-            onClick={() => setCurrentUser(null)}
+            onClick={handleLogout}
             className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white px-3 py-2 rounded-xl transition-all duration-200 flex items-center gap-2 border border-slate-700/60 text-xs font-medium"
           >
             <LogOut className="w-4 h-4" />
@@ -460,6 +494,9 @@ function ProfessorApp({ professor }) {
         professor_id: professor.id
       });
       setActiveSessionId(res.data.session_id);
+      if (res.data.token) {
+        setCurrentToken(res.data.token);
+      }
       setSessionActive(true);
       setLiveHeadcount([]);
       connectWebSocket(selectedSubject);
@@ -479,48 +516,67 @@ function ProfessorApp({ professor }) {
       console.error("Error ending session", err);
     } finally {
       setSessionActive(false);
+      setActiveSessionId(null);
+      setCurrentToken('------');
+      if (timerRef.current) clearInterval(timerRef.current);
       if (wsRef.current) wsRef.current.close();
-      fetchRecentSessions(selectedSubject);
+      if (selectedSubject) fetchRecentSessions(selectedSubject);
+    }
+  };
+
+  const sessionActiveRef = useRef(sessionActive);
+  useEffect(() => { sessionActiveRef.current = sessionActive; }, [sessionActive]);
+
+  const fetchLiveHeadcount = async (sessionId) => {
+    if (!sessionId) return;
+    try {
+      const res = await axios.get(`${API_URL}/professor/session/${sessionId}/faces`);
+      setLiveHeadcount(res.data);
+    } catch (err) {
+      console.error("Failed to fetch live headcount", err);
     }
   };
 
   const connectWebSocket = (code) => {
+    if (!code) return;
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsHost = window.location.host;
-    wsRef.current = new WebSocket(`${wsProtocol}//${wsHost}/ws/session/${code}`);
-    wsRef.current.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === 'NEW_ATTENDANCE') {
-          setLiveHeadcount(prev => {
-            const exists = prev.some(item => item.student_id === data.student_id);
-            if (exists) {
-              return prev.map(item => item.student_id === data.student_id ? { ...item, ...data } : item);
+    try {
+      const ws = new WebSocket(`${wsProtocol}//${wsHost}/ws/session/${code}`);
+      wsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'NEW_ATTENDANCE' || data.type === 'PROXY_STATUS_UPDATED') {
+            if (activeSessionId) {
+              fetchLiveHeadcount(activeSessionId);
+            } else {
+              setLiveHeadcount(prev => {
+                const exists = prev.some(item => item.student_id === data.student_id);
+                if (exists) {
+                  return prev.map(item => item.student_id === data.student_id ? { ...item, ...data } : item);
+                }
+                return [...prev, data];
+              });
             }
-            return [...prev, data];
-          });
-          if (auditModalSessionId && auditModalSessionId === activeSessionId) {
-            fetchSessionFaces(activeSessionId);
+            if (auditModalSessionId) {
+              fetchSessionFaces(auditModalSessionId);
+            }
           }
-        } else if (data.type === 'PROXY_STATUS_UPDATED') {
-          setLiveHeadcount(prev => prev.map(item => {
-            if (item.student_id === data.student_id) {
-              return { ...item, status: data.status, is_flagged_proxy: data.is_flagged_proxy };
-            }
-            return item;
-          }));
-          setAuditFaces(prev => prev.map(item => {
-            if (item.student_id === data.student_id) {
-              return { ...item, status: data.status, is_flagged_proxy: data.is_flagged_proxy };
-            }
-            return item;
-          }));
-          if (selectedSubject) fetchRecentSessions(selectedSubject);
+        } catch (e) {
+          console.error("WS error", e);
         }
-      } catch (e) {
-        console.error("WS error", e);
-      }
-    };
+      };
+
+      ws.onclose = () => {
+        if (sessionActiveRef.current) {
+          setTimeout(() => connectWebSocket(code), 2500);
+        }
+      };
+    } catch (e) {
+      console.error("WebSocket connection failed", e);
+    }
   };
 
   const fetchLiveToken = async () => {
@@ -540,12 +596,14 @@ function ProfessorApp({ professor }) {
   useEffect(() => {
     if (sessionActive) {
       fetchLiveToken();
+      if (activeSessionId) fetchLiveHeadcount(activeSessionId);
       setTimer(5);
 
       timerRef.current = setInterval(() => {
         setTimer(prev => {
           if (prev === 1) {
             fetchLiveToken();
+            if (activeSessionId) fetchLiveHeadcount(activeSessionId);
             return 5;
           }
           return prev - 1;
@@ -557,12 +615,12 @@ function ProfessorApp({ professor }) {
     }
 
     return () => clearInterval(timerRef.current);
-  }, [sessionActive, selectedSubject]);
+  }, [sessionActive, selectedSubject, activeSessionId]);
 
   const qrData = encodeURIComponent(`TRUSTATTENDANCE:${selectedSubject}:${currentToken}`);
   const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=256x256&data=${qrData}&margin=10`;
 
-  const flaggedProxyCount = liveHeadcount.filter(i => i.is_flagged_proxy || i.status === 'flagged_proxy').length;
+  const flaggedProxyCount = liveHeadcount.filter(i => i.is_flagged_proxy || i.status === 'flagged_proxy' || i.status === 'flagged_no_face').length;
 
   return (
     <div className="max-w-5xl mx-auto space-y-8">
@@ -775,12 +833,14 @@ function ProfessorApp({ professor }) {
                   <p className="text-slate-500 text-xs text-center py-8">Waiting for student scans...</p>
                 ) : (
                   liveHeadcount.map((item, idx) => {
-                    const isProxy = item.is_flagged_proxy || item.status === 'flagged_proxy';
+                    const isNoFace = item.status === 'flagged_no_face';
+                    const isProxy = item.is_flagged_proxy || item.status === 'flagged_proxy' || isNoFace;
                     const isConfirmed = item.status === 'confirmed_proxy';
                     return (
                       <div 
                         key={idx} 
                         className={`p-3 rounded-xl text-xs flex justify-between items-center border transition-all ${
+                          isNoFace ? 'bg-amber-950/40 border-amber-500/40' :
                           isProxy ? 'bg-rose-950/40 border-rose-500/40' : 
                           isConfirmed ? 'bg-red-950/60 border-red-700/60' : 
                           'bg-slate-950 border-slate-800'
@@ -804,10 +864,12 @@ function ProfessorApp({ professor }) {
                           {isProxy ? (
                             <button 
                               onClick={() => openAuditModal(activeSessionId || item.session_id)}
-                              className="px-2 py-1 bg-rose-500 hover:bg-rose-600 text-white rounded-lg text-[10px] font-black flex items-center gap-1 shadow-md shadow-rose-900/40 animate-pulse"
-                              title="Potential proxy facial duplicate detected"
+                              className={`px-2 py-1 text-white rounded-lg text-[10px] font-black flex items-center gap-1 shadow-md animate-pulse ${
+                                isNoFace ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-900/40' : 'bg-rose-500 hover:bg-rose-600 shadow-rose-900/40'
+                              }`}
+                              title={isNoFace ? "Camera was obscured / no face detected" : "Potential proxy facial duplicate detected"}
                             >
-                              <AlertTriangle className="w-3 h-3" /> PROXY
+                              <AlertTriangle className="w-3 h-3" /> {isNoFace ? "NO FACE" : "PROXY"}
                             </button>
                           ) : isConfirmed ? (
                             <span className="px-2 py-1 bg-red-900/60 border border-red-700 text-red-200 rounded-lg text-[10px] font-bold">
@@ -891,7 +953,8 @@ function ProfessorApp({ professor }) {
                 </div>
               ) : (
                 auditFaces.map((rec) => {
-                  const isProxy = rec.is_flagged_proxy || rec.status === 'flagged_proxy';
+                  const isNoFace = rec.status === 'flagged_no_face';
+                  const isProxy = rec.is_flagged_proxy || rec.status === 'flagged_proxy' || isNoFace;
                   const isConfirmed = rec.status === 'confirmed_proxy';
                   const isLoadingAction = proxyActionLoading === rec.student_id;
 
@@ -899,6 +962,7 @@ function ProfessorApp({ professor }) {
                     <div 
                       key={rec.student_id} 
                       className={`p-4 rounded-2xl border transition-all ${
+                        isNoFace ? 'bg-amber-950/20 border-amber-500/40 shadow-lg shadow-amber-950/30' :
                         isProxy ? 'bg-rose-950/20 border-rose-500/40 shadow-lg shadow-rose-950/30' : 
                         isConfirmed ? 'bg-red-950/40 border-red-700/60' : 
                         'bg-slate-950 border-slate-800'
@@ -915,7 +979,12 @@ function ProfessorApp({ professor }) {
                         </div>
 
                         <div>
-                          {isProxy ? (
+                          {isNoFace ? (
+                            <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-amber-500/20 border border-amber-500/40 text-amber-300 rounded-full text-xs font-bold">
+                              <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                              Suspicious Evasion: No Face Detected
+                            </span>
+                          ) : isProxy ? (
                             <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-rose-500/20 border border-rose-500/40 text-rose-300 rounded-full text-xs font-bold">
                               <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
                               Potential Proxy Flagged {rec.similarity ? `(${(rec.similarity * 100).toFixed(1)}% match)` : ''}
@@ -941,9 +1010,15 @@ function ProfessorApp({ professor }) {
                           {rec.photo ? (
                             <div className="relative rounded-xl overflow-hidden border border-slate-800 bg-black aspect-4/3 flex items-center justify-center">
                               <img src={rec.photo} alt={rec.student_name} className="w-full h-full object-cover" />
-                              <div className="absolute bottom-2 left-2 bg-slate-900/80 backdrop-blur-md px-2 py-0.5 rounded text-[10px] text-emerald-400 font-mono flex items-center gap-1">
-                                <Check className="w-3 h-3 text-emerald-400" /> Face Detected
-                              </div>
+                              {isNoFace ? (
+                                <div className="absolute bottom-2 left-2 bg-rose-950/90 border border-rose-500/40 backdrop-blur-md px-2 py-0.5 rounded text-[10px] text-rose-300 font-mono flex items-center gap-1">
+                                  <X className="w-3 h-3 text-rose-400" /> No Face / Obscured
+                                </div>
+                              ) : (
+                                <div className="absolute bottom-2 left-2 bg-slate-900/80 backdrop-blur-md px-2 py-0.5 rounded text-[10px] text-emerald-400 font-mono flex items-center gap-1">
+                                  <Check className="w-3 h-3 text-emerald-400" /> Face Detected
+                                </div>
+                              )}
                             </div>
                           ) : (
                             <div className="rounded-xl border border-slate-800 bg-slate-900/60 aspect-4/3 flex items-center justify-center text-xs text-slate-500">
@@ -954,7 +1029,17 @@ function ProfessorApp({ professor }) {
 
                         {/* If Proxy Detected, Show side-by-side match details and actions */}
                         <div className="space-y-3">
-                          {isProxy && (
+                          {isNoFace ? (
+                            <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-xl space-y-2">
+                              <div className="flex items-start gap-2">
+                                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                                <div className="text-xs text-amber-200">
+                                  <strong className="block text-amber-300 font-bold">Evasion Alert: Camera Obscured</strong>
+                                  {rec.reason || "No face was detected in this camera frame. The student may have covered the camera lens or pointed away to evade duplicate facial proxy detection."}
+                                </div>
+                              </div>
+                            </div>
+                          ) : isProxy ? (
                             <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl space-y-2">
                               <div className="flex items-start gap-2">
                                 <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
@@ -964,7 +1049,7 @@ function ProfessorApp({ professor }) {
                                 </div>
                               </div>
                             </div>
-                          )}
+                          ) : null}
 
                           {isConfirmed && (
                             <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-xs text-red-300">
@@ -1087,6 +1172,8 @@ function StudentApp({ student, onUserUpdate }) {
   const [isBound, setIsBound] = useState(Boolean(student.hardware_id));
   const [hardwareId, setHardwareId] = useState(student.hardware_id || localStorage.getItem(`bound_device_${student.id}`) || null);
   const [isBindingLoading, setIsBindingLoading] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const isSyncingRef = useRef(false);
 
   const qrScannerRef = useRef(null);
   const selfieVideoRef = useRef(null);
@@ -1109,45 +1196,118 @@ function StudentApp({ student, onUserUpdate }) {
       .catch(e => console.error("Could not fetch device status", e));
   }, [student.id]);
 
+  const syncOfflineQueue = async (isManual = false) => {
+    if (isSyncingRef.current) return;
+    const queue = await getOfflineAttendance();
+    if (!queue || queue.length === 0) {
+      if (isManual) {
+        setStatusMsg({ type: 'info', text: "No pending offline attendance records to sync." });
+      }
+      setQueueCount(0);
+      return;
+    }
+
+    if (!navigator.onLine) {
+      if (isManual) {
+        setStatusMsg({ type: 'warning', text: "Your device is currently offline. Connect to internet before syncing." });
+      }
+      return;
+    }
+
+    isSyncingRef.current = true;
+    setIsSyncing(true);
+    setStatusMsg({ type: 'warning', text: `Syncing ${queue.length} offline attendance record(s) to server...` });
+
+    let successCount = 0;
+    let duplicateCount = 0;
+    let failedCount = 0;
+    let lastErrorMsg = null;
+
+    for (const item of queue) {
+      try {
+        const payload = {
+          subject_code: item.subjectCode,
+          student_id: item.studentId,
+          token: item.token,
+          timestamp: item.timestamp,
+          signature: item.signature,
+          hardware_id: item.hardware_id,
+          image_b64: item.image_b64
+        };
+        await axios.post(`${API_URL}/attendance/verify`, payload);
+        // Only delete confirmed entries from IndexedDB
+        await deleteOfflineRecord(item.id);
+        successCount++;
+      } catch (e) {
+        const status = e.response?.status;
+        const detail = e.response?.data?.detail || e.message || 'Network error';
+        lastErrorMsg = detail;
+
+        if (status === 400) {
+          if (detail?.includes("already recorded") || detail?.includes("Duplicate")) {
+            // Attendance was already verified on server - safe to delete local copy
+            duplicateCount++;
+            await deleteOfflineRecord(item.id);
+          } else if (detail?.includes("Evasion Warning") || detail?.includes("No face detected")) {
+            // Evasion was logged on server
+            failedCount++;
+            await deleteOfflineRecord(item.id);
+          } else {
+            failedCount++;
+          }
+        } else if (status === 401 || status === 403) {
+          // Token expired or hardware mismatch - definitive rejection
+          failedCount++;
+          await deleteOfflineRecord(item.id);
+        } else {
+          // Network Error or Server 500: DO NOT DELETE! Keep in IndexedDB so student does not lose attendance
+          console.warn("Sync encountered connection issue; keeping record for retry:", e);
+          failedCount++;
+        }
+      }
+    }
+
+    const remaining = await getOfflineAttendance();
+    setQueueCount(remaining.length);
+    isSyncingRef.current = false;
+    setIsSyncing(false);
+
+    if (successCount > 0) {
+      setStatusMsg({
+        type: 'success',
+        text: `Successfully synced ${successCount} offline record(s) to server!` +
+              (duplicateCount > 0 ? ` (${duplicateCount} duplicate entries skipped)` : '')
+      });
+    } else if (duplicateCount > 0) {
+      setStatusMsg({
+        type: 'info',
+        text: `All ${duplicateCount} offline record(s) were already logged on the server.`
+      });
+    } else if (remaining.length > 0) {
+      setStatusMsg({
+        type: 'error',
+        text: `Sync could not complete (${lastErrorMsg}). ${remaining.length} record(s) remain safely saved in phone storage. Tap 'Sync Now' when internet is stable.`
+      });
+    } else if (failedCount > 0) {
+      setStatusMsg({
+        type: 'error',
+        text: `Sync finished with notice: ${lastErrorMsg}`
+      });
+    }
+  };
+
   useEffect(() => {
-    const handleOnlineStatus = async () => {
+    let debounceTimer = null;
+    const handleOnlineStatus = () => {
       const online = navigator.onLine;
       setIsOffline(!online);
       
-      // Auto-sync when internet returns
+      // Auto-sync when internet returns, with 1.5s debounce for DNS/IP stabilization
       if (online) {
-        const queue = await getOfflineAttendance();
-        if (queue.length > 0) {
-          setStatusMsg({ type: 'warning', text: `Syncing ${queue.length} offline records...` });
-          let successCount = 0;
-          let duplicateCount = 0;
-          for (const item of queue) {
-            try {
-              await axios.post(`${API_URL}/attendance/verify`, {
-                subject_code: item.subjectCode,
-                student_id: item.studentId,
-                token: item.token,
-                timestamp: item.timestamp,
-                signature: item.signature,
-                hardware_id: item.hardware_id,
-                image_b64: item.image_b64
-              });
-              successCount++;
-            } catch (e) {
-              if (e.response?.status === 400) {
-                duplicateCount++;
-              }
-              console.error("Sync error", e);
-            }
-          }
-          await clearOfflineQueue();
-          setQueueCount(0);
-          if (duplicateCount > 0) {
-            setStatusMsg({ type: 'warning', text: `Sync completed: ${successCount} verified, ${duplicateCount} duplicate entries ignored.` });
-          } else {
-            setStatusMsg({ type: 'success', text: `Successfully synced ${successCount} offline records to server!` });
-          }
-        }
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          syncOfflineQueue(false);
+        }, 1500);
       }
     };
 
@@ -1156,6 +1316,7 @@ function StudentApp({ student, onUserUpdate }) {
     loadQueueCount();
 
     return () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
       window.removeEventListener('online', handleOnlineStatus);
       window.removeEventListener('offline', handleOnlineStatus);
     };
@@ -1274,7 +1435,7 @@ function StudentApp({ student, onUserUpdate }) {
               setScannedSession({
                 subjectCode: subCode,
                 token: scannedToken,
-                timestamp: Date.now() / 1000.0
+                timestamp: Math.floor(Date.now() / 1000)
               });
               setFlowStep('selfie_capture');
             },
@@ -1308,7 +1469,7 @@ function StudentApp({ student, onUserUpdate }) {
                 setScannedSession({
                   subjectCode: subCode,
                   token: scannedToken,
-                  timestamp: Date.now() / 1000.0
+                  timestamp: Math.floor(Date.now() / 1000)
                 });
                 setFlowStep('selfie_capture');
               },
@@ -1421,24 +1582,26 @@ function StudentApp({ student, onUserUpdate }) {
   // ========================================================
   const submitAttendancePayload = async (sessionData, imageB64) => {
     const currentHwId = hardwareId || localStorage.getItem(`bound_device_${student.id}`) || student.hardware_id;
-    const scanTimestamp = sessionData?.timestamp || (Date.now() / 1000.0);
+    const scanTimestamp = Math.floor(sessionData?.timestamp || (Date.now() / 1000.0));
     const signature = await generateSignature(student.id, sessionData.token, scanTimestamp);
 
-    if (isOfflineRef.current) {
-      await saveOfflineAttendance({
-        subjectCode: sessionData.subjectCode,
-        studentId: student.id,
-        token: sessionData.token,
-        timestamp: scanTimestamp,
-        signature: signature,
-        hardware_id: currentHwId,
-        image_b64: imageB64
-      });
+    const offlineRecord = {
+      subjectCode: sessionData.subjectCode,
+      studentId: student.id,
+      token: sessionData.token,
+      timestamp: scanTimestamp,
+      signature: signature,
+      hardware_id: currentHwId,
+      image_b64: imageB64
+    };
+
+    if (isOfflineRef.current || !navigator.onLine) {
+      await saveOfflineAttendance(offlineRecord);
       await loadQueueCount();
       setFlowStep('idle');
       setStatusMsg({
         type: 'warning',
-        text: `Offline Mode: QR scanned & face verified locally. Will auto-sync when classroom Wi-Fi returns.`
+        text: `Offline Mode: Attendance recorded locally with face capture & cryptographic signature! It will sync automatically when Wi-Fi returns.`
       });
       return;
     }
@@ -1468,16 +1631,27 @@ function StudentApp({ student, onUserUpdate }) {
       }
     } catch (err) {
       setFlowStep('idle');
+      // If network connection failed during post request (e.g. timeout / connection reset)
+      if (!err.response || err.code === 'ERR_NETWORK') {
+        await saveOfflineAttendance(offlineRecord);
+        await loadQueueCount();
+        setStatusMsg({
+          type: 'warning',
+          text: `Network dropped during submission! Attendance was safely cached in phone storage and will sync once internet returns.`
+        });
+        return;
+      }
+
       const detail = err.response?.data?.detail || 'Verification failed.';
       if (detail.includes("already recorded") || detail.includes("Duplicate")) {
         setStatusMsg({
           type: 'info',
           text: `Attendance is already recorded for this lecture session. You are marked present!`
         });
-      } else if (detail.includes("No face detected")) {
+      } else if (detail.includes("No face detected") || detail.includes("Evasion Warning")) {
         setStatusMsg({
           type: 'error',
-          text: `No face detected in selfie. Please ensure your face is well-lit and directly facing the camera.`
+          text: `⚠️ No Face Detected! This attempt has been logged and flagged to the professor as a potential proxy evasion. Please ensure your face is well-lit and directly facing the camera to re-verify.`
         });
       } else {
         setStatusMsg({ type: 'error', text: detail });
@@ -1533,12 +1707,22 @@ function StudentApp({ student, onUserUpdate }) {
         </div>
 
         {queueCount > 0 && (
-          <div className="bg-amber-500/10 border border-amber-500/20 p-4 rounded-2xl text-xs text-amber-300 flex items-start gap-3">
-            <AlertCircle className="w-5 h-5 shrink-0 text-amber-400 mt-0.5" />
-            <div>
-              <p className="font-bold">Pending Offline Scans ({queueCount})</p>
-              <p className="text-amber-300/80 mt-0.5">Scans are cryptographically signed & facial embedded. Will auto-sync when classroom Wi-Fi returns.</p>
+          <div className="bg-amber-500/10 border border-amber-500/20 p-4 rounded-2xl text-xs text-amber-300 flex items-center justify-between gap-3 animate-in fade-in">
+            <div className="flex items-start gap-2.5">
+              <AlertCircle className="w-5 h-5 shrink-0 text-amber-400 mt-0.5" />
+              <div>
+                <p className="font-bold">Pending Offline Scans ({queueCount})</p>
+                <p className="text-amber-300/80 mt-0.5 text-[11px]">Scans are signed & saved locally on your phone. Tap to sync now.</p>
+              </div>
             </div>
+            <button
+              onClick={() => syncOfflineQueue(true)}
+              disabled={isSyncing || isOffline}
+              className="px-3.5 py-2 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold rounded-xl text-xs shrink-0 flex items-center gap-1.5 shadow-md shadow-amber-500/20 transition-all active:scale-95"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+              <span>{isSyncing ? 'Syncing...' : 'Sync Now'}</span>
+            </button>
           </div>
         )}
 

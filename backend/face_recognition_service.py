@@ -85,55 +85,55 @@ def process_face_image(image_b64: str) -> Dict[str, Any]:
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray_eq = cv2.equalizeHist(gray)
+    h_img, w_img = img.shape[:2]
+    min_dim = min(h_img, w_img)
+    # A true foreground selfie face must occupy at least 15% of the frame dimension
+    min_face_size = max(50, int(min_dim * 0.16))
 
-    # 1. Primary frontal face detection
-    faces = face_cascade.detectMultiScale(
-        gray_eq,
-        scaleFactor=1.1,
-        minNeighbors=4,
-        minSize=(35, 35)
-    )
-
-    # 2. Relaxed threshold fallback for mobile angles/lighting
-    if len(faces) == 0:
-        faces = face_cascade.detectMultiScale(
-            gray_eq,
-            scaleFactor=1.05,
-            minNeighbors=2,
-            minSize=(25, 25)
-        )
-
-    # 3. If no face detected, try non-equalized gray (some direct sunlight can over-saturate equalized gray)
-    if len(faces) == 0:
-        faces = face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.05,
-            minNeighbors=2,
-            minSize=(25, 25)
-        )
-
-    # 4. Mobile orientation fallback (if phone sent 90deg rotated canvas buffer)
-    if len(faces) == 0:
-        for rot in [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_90_COUNTERCLOCKWISE]:
-            rot_gray = cv2.rotate(gray_eq, rot)
-            rot_faces = face_cascade.detectMultiScale(
-                rot_gray,
-                scaleFactor=1.08,
-                minNeighbors=2,
-                minSize=(25, 25)
+    candidates = []
+    # Test equalized gray first, then natural gray (for direct lighting)
+    for test_gray in [gray_eq, gray]:
+        try:
+            boxes, _, weights = face_cascade.detectMultiScale3(
+                test_gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(min_face_size, min_face_size),
+                outputRejectLevels=True
             )
-            if len(rot_faces) > 0:
-                faces = rot_faces
-                img = cv2.rotate(img, rot)
-                gray = cv2.rotate(gray, rot)
-                break
+        except Exception:
+            boxes, weights = [], []
 
-    if len(faces) == 0:
+        for (x, y, w, h), score in zip(boxes, weights):
+            # 1. Require solid confidence score from cascade stages
+            if score < 2.2:
+                continue
+
+            # 2. Strict aspect ratio validation: human frontal face is roughly square (0.72 - 1.28)
+            aspect = float(w) / float(h)
+            if aspect < 0.72 or aspect > 1.28:
+                continue
+
+            # 3. Reject flat textures, finger coverings, blank walls, or extreme contrast
+            face_roi = gray[y : y + h, x : x + w]
+            if face_roi.std() < 16.0 or face_roi.mean() < 20 or face_roi.mean() > 248:
+                continue
+
+            candidates.append({
+                "box": (int(x), int(y), int(w), int(h)),
+                "score": float(score),
+                "area": int(w * h)
+            })
+
+        if len(candidates) > 0:
+            break
+
+    if len(candidates) == 0:
         raise ValueError("No face detected in camera frame. Please ensure your face is well-lit and directly facing the camera.")
 
-    # Select the largest face by area
-    largest_face = max(faces, key=lambda f: f[2] * f[3])
-    x, y, w, h = largest_face
+    # Select the most prominent genuine face candidate
+    best_candidate = max(candidates, key=lambda c: c["score"] * np.sqrt(c["area"]))
+    x, y, w, h = best_candidate["box"]
 
     # Crop and extract embedding using SFace
     sess, in_name = get_ort_session()
@@ -181,6 +181,38 @@ def process_face_image(image_b64: str) -> Dict[str, Any]:
         "box": [int(x), int(y), int(w), int(h)],
         "thumbnail_b64": thumb_b64
     }
+
+def create_obscured_thumbnail(image_b64: Optional[str], reason: str = "NO FACE DETECTED") -> str:
+    """
+    Decodes the given base64 image (or creates a dark canvas if missing/corrupt),
+    resizes to 320x240, and stamps a prominent red alert frame & banner indicating
+    that no face was found or the camera was obscured.
+    """
+    img = None
+    if image_b64:
+        try:
+            raw_b64 = image_b64.split(",")[1] if "," in image_b64 else image_b64
+            img_bytes = base64.b64decode(raw_b64)
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        except Exception:
+            img = None
+
+    if img is None:
+        # Create dark warning canvas
+        img = np.zeros((240, 320, 3), dtype=np.uint8)
+        img[:] = (25, 20, 35)
+
+    thumb = cv2.resize(img, (320, 240))
+    # Draw red border
+    cv2.rectangle(thumb, (2, 2), (317, 237), (0, 0, 220), 3)
+    # Red bottom banner
+    cv2.rectangle(thumb, (0, 195), (320, 240), (0, 0, 180), -1)
+    # Warning icon / text
+    cv2.putText(thumb, f"! {reason}", (12, 224), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+
+    _, buffer = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return "data:image/jpeg;base64," + base64.b64encode(buffer).decode('utf-8')
 
 def check_proxy_attempt(new_embedding: List[float], session_id: int, student_id: int, threshold: float = 0.68) -> Dict[str, Any]:
     """
@@ -235,17 +267,21 @@ def save_face_record(
     session_id: int,
     student_id: int,
     student_name: str,
-    embedding: List[float],
+    embedding: Optional[List[float]],
     thumbnail_b64: str,
     is_flagged_proxy: bool,
     matched_with_id: Optional[int] = None,
     matched_with_name: Optional[str] = None,
-    similarity: Optional[float] = None
+    similarity: Optional[float] = None,
+    status: Optional[str] = None,
+    reason: Optional[str] = None
 ):
     records = load_session_records(session_id)
 
     # Remove any existing record for this student in this session (e.g. retry)
     records = [r for r in records if r.get("student_id") != student_id]
+
+    determined_status = status or ("flagged_proxy" if is_flagged_proxy else "verified")
 
     records.append({
         "student_id": student_id,
@@ -253,10 +289,11 @@ def save_face_record(
         "embedding": embedding,
         "photo": thumbnail_b64,
         "is_flagged_proxy": is_flagged_proxy,
-        "status": "flagged_proxy" if is_flagged_proxy else "verified",
+        "status": determined_status,
         "matched_with_id": matched_with_id,
         "matched_with_name": matched_with_name,
-        "similarity": similarity
+        "similarity": similarity,
+        "reason": reason
     })
     _session_cache[session_id] = records
     persist_session_records(session_id)
@@ -273,7 +310,8 @@ def get_session_face_records(session_id: int) -> List[Dict[str, Any]]:
             "status": r.get("status", "verified"),
             "matched_with_id": r.get("matched_with_id"),
             "matched_with_name": r.get("matched_with_name"),
-            "similarity": r.get("similarity")
+            "similarity": r.get("similarity"),
+            "reason": r.get("reason")
         }
         for r in records
     ]

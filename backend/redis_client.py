@@ -21,20 +21,45 @@ class InMemoryRedis:
             return True
         return False
 
-    def hset(self, key, mapping=None, **kwargs):
-        self._is_expired(key)
-        if key not in self._store or not isinstance(self._store[key], dict):
-            self._store[key] = {}
+    def hset(self, name, key=None, value=None, mapping=None, **kwargs):
+        self._is_expired(name)
+        if name not in self._store or not isinstance(self._store[name], dict):
+            self._store[name] = {}
+        count = 0
+        if key is not None and value is not None:
+            self._store[name][str(key)] = str(value)
+            count += 1
         if mapping:
-            self._store[key].update(mapping)
+            self._store[name].update({str(k): str(v) for k, v in mapping.items()})
+            count += len(mapping)
         if kwargs:
-            self._store[key].update(kwargs)
-        return len(mapping or kwargs)
+            self._store[name].update({str(k): str(v) for k, v in kwargs.items()})
+            count += len(kwargs)
+        return count
 
     def hget(self, key, field):
         if self._is_expired(key):
             return None
         return self._store.get(key, {}).get(field)
+
+    def delete(self, *keys):
+        count = 0
+        for k in keys:
+            if k in self._store:
+                self._store.pop(k, None)
+                self._expiry.pop(k, None)
+                count += 1
+        return count
+
+    def hdel(self, key, *fields):
+        if key in self._store and isinstance(self._store[key], dict):
+            count = 0
+            for f in fields:
+                if f in self._store[key]:
+                    self._store[key].pop(f, None)
+                    count += 1
+            return count
+        return 0
 
     def exists(self, key):
         if self._is_expired(key):

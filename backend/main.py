@@ -255,14 +255,33 @@ def start_session(data: SessionStart, db: Session = Depends(get_db)):
     totp_secret = pyotp.random_base32()
     session_key = f"session:{data.subject_code}"
     
+    # Clear any previous session state (including lingering is_ended flag)
+    redis_db.delete(session_key)
     redis_db.hset(session_key, mapping={
         "secret": totp_secret,
         "professor_id": str(data.professor_id),
-        "session_id": str(new_session.id)
+        "session_id": str(new_session.id),
+        "is_ended": "0"
     })
     redis_db.expire(session_key, 7200)
+
+    # Archive secret per session ID for 7 days so offline student syncing never loses past session context
+    archive_key = f"session_archive:{new_session.id}"
+    redis_db.hset(archive_key, mapping={
+        "secret": totp_secret,
+        "professor_id": str(data.professor_id),
+        "session_id": str(new_session.id),
+        "subject_code": data.subject_code
+    })
+    redis_db.expire(archive_key, 604800)
     
-    return {"message": "Session started", "secret": totp_secret, "session_id": new_session.id}
+    totp = pyotp.TOTP(totp_secret, interval=5)
+    return {
+        "message": "Session started", 
+        "secret": totp_secret, 
+        "session_id": new_session.id,
+        "token": totp.now()
+    }
 
 @app.post("/session/end")
 def end_session(data: SessionEnd, db: Session = Depends(get_db)):
@@ -274,13 +293,15 @@ def end_session(data: SessionEnd, db: Session = Depends(get_db)):
             sess.is_active = 0
             sess.end_time = datetime.now(timezone.utc)
             db.commit()
-    redis_db.expire(session_key, 1)
+    # Mark session as ended for token generation, but keep in store for 4 hours so offline student scans can still sync!
+    redis_db.hset(session_key, "is_ended", "1")
+    redis_db.expire(session_key, 14400)
     return {"status": "success", "message": "Session ended"}
 
 @app.get("/session/token/{subject_code}")
 def get_current_token(subject_code: str):
     session_key = f"session:{subject_code}"
-    if not redis_db.exists(session_key):
+    if not redis_db.exists(session_key) or redis_db.hget(session_key, "is_ended") == "1":
         raise HTTPException(status_code=404, detail="No active session found.")
     secret = redis_db.hget(session_key, "secret")
     totp = pyotp.TOTP(secret, interval=5)
@@ -288,32 +309,6 @@ def get_current_token(subject_code: str):
 
 @app.post("/attendance/verify")
 async def verify_attendance(data: AttendanceVerify, db: Session = Depends(get_db)):
-    session_key = f"session:{data.subject_code}"
-    
-    if not redis_db.exists(session_key):
-        raise HTTPException(status_code=404, detail="No active session found. Wait for professor.")
-        
-    secret = redis_db.hget(session_key, "secret")
-    totp = pyotp.TOTP(secret, interval=5)
-    
-    clean_token = data.token.strip().replace(" ", "").upper()
-    if ":" in clean_token:
-        clean_token = clean_token.split(":")[-1]
-    
-    # 1. Digital Signature & Offline Timestamp Verification
-    client_time = datetime.now()
-    if data.timestamp and data.signature:
-        expected_sig = hashlib.sha256(f"{data.student_id}:{clean_token}:{data.timestamp}".encode()).hexdigest()
-        if expected_sig != data.signature:
-            raise HTTPException(status_code=403, detail="Invalid digital signature. Anti-tamper triggered.")
-        client_time = datetime.fromtimestamp(data.timestamp)
-
-    # 2. Time-Machine Token Check (Verify token was valid at exact time of scan)
-    # Allow 60-second window (12 * 5s) to comfortably accommodate front camera selfie verification
-    is_valid_token = totp.verify(clean_token, valid_window=12, for_time=client_time) or totp.verify(clean_token, valid_window=12)
-    if not is_valid_token:
-        raise HTTPException(status_code=401, detail="Invalid or expired token. Proxies denied.")
-        
     subject = db.query(models.Subject).filter(models.Subject.code == data.subject_code).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Subject not found")
@@ -321,6 +316,53 @@ async def verify_attendance(data: AttendanceVerify, db: Session = Depends(get_db
     student = db.query(models.User).filter(models.User.id == data.student_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student not found")
+
+    clean_token = data.token.strip().replace(" ", "").upper()
+    if ":" in clean_token:
+        clean_token = clean_token.split(":")[-1]
+    
+    # 1. Digital Signature & Offline Timestamp Verification
+    client_time = datetime.utcnow()
+    if data.timestamp and data.signature:
+        ts_int = int(data.timestamp)
+        expected_sig1 = hashlib.sha256(f"{data.student_id}:{clean_token}:{ts_int}".encode()).hexdigest()
+        expected_sig2 = hashlib.sha256(f"{data.student_id}:{clean_token}:{data.timestamp}".encode()).hexdigest()
+        if data.signature not in [expected_sig1, expected_sig2]:
+            raise HTTPException(status_code=403, detail="Invalid digital signature. Anti-tamper triggered.")
+        client_time = datetime.utcfromtimestamp(ts_int)
+
+    # 2. Time-Machine Token Check (Verify token was valid at exact time of scan)
+    # Check active session secret or past session archive for this subject
+    session_key = f"session:{data.subject_code}"
+    target_session_id = None
+    is_valid_token = False
+
+    if redis_db.exists(session_key):
+        active_secret = redis_db.hget(session_key, "secret")
+        session_id_str = redis_db.hget(session_key, "session_id")
+        if session_id_str:
+            target_session_id = int(session_id_str)
+        if active_secret:
+            active_totp = pyotp.TOTP(active_secret, interval=5)
+            if active_totp.verify(clean_token, valid_window=60, for_time=client_time) or active_totp.verify(clean_token, valid_window=60):
+                is_valid_token = True
+
+    # If active session did not match (e.g. offline scan from earlier in class or after session closed):
+    if not is_valid_token:
+        recent_sessions = db.query(models.ClassSession).filter(
+            models.ClassSession.subject_id == subject.id
+        ).order_by(models.ClassSession.start_time.desc()).limit(5).all()
+        for past_sess in recent_sessions:
+            arch_secret = redis_db.hget(f"session_archive:{past_sess.id}", "secret")
+            if arch_secret:
+                past_totp = pyotp.TOTP(arch_secret, interval=5)
+                if past_totp.verify(clean_token, valid_window=60, for_time=client_time) or past_totp.verify(clean_token, valid_window=60):
+                    is_valid_token = True
+                    target_session_id = past_sess.id
+                    break
+
+    if not is_valid_token:
+        raise HTTPException(status_code=401, detail="Invalid or expired token. Proxies denied.")
 
     # 3. 1:1 Hardware Device Binding Validation
     if student.hardware_id:
@@ -344,43 +386,100 @@ async def verify_attendance(data: AttendanceVerify, db: Session = Depends(get_db
         db.commit()
 
     # 4. Prohibit Duplicate Attendance by same student ID in the same session
-    session_id_str = redis_db.hget(session_key, "session_id")
-    target_session_id = int(session_id_str) if session_id_str else None
+    if not target_session_id:
+        session_id_str = redis_db.hget(session_key, "session_id")
+        target_session_id = int(session_id_str) if session_id_str else None
 
+    prior_log = None
     if target_session_id:
-        duplicate = db.query(models.AttendanceLog).filter(
+        prior_log = db.query(models.AttendanceLog).filter(
             models.AttendanceLog.student_id == data.student_id,
             models.AttendanceLog.session_id == target_session_id
         ).first()
-        if duplicate:
+        if prior_log and prior_log.status != "flagged_no_face":
             raise HTTPException(
                 status_code=400, 
                 detail="Attendance already recorded for this lecture session. Duplicate entries are strictly prohibited."
             )
     else:
         # Fallback check if session ID is missing from cache (e.g. within same 45 min window)
-        duplicate = db.query(models.AttendanceLog).filter(
+        prior_log = db.query(models.AttendanceLog).filter(
             models.AttendanceLog.student_id == data.student_id,
             models.AttendanceLog.subject_id == subject.id,
             models.AttendanceLog.timestamp >= client_time - timedelta(minutes=45)
         ).first()
-        if duplicate:
+        if prior_log and prior_log.status != "flagged_no_face":
             raise HTTPException(
                 status_code=400, 
                 detail="Duplicate attendance detected for this lecture timeframe."
             )
 
     # 5. Facial Verification & Proxy Detection
+    face_data = None
+    no_face_reason = None
     if not data.image_b64:
-        raise HTTPException(status_code=400, detail="No face detected in camera frame. Live camera capture is required.")
+        no_face_reason = "No camera frame provided (camera was not enabled or stream empty)."
+    else:
+        try:
+            face_data = face_recognition_service.process_face_image(data.image_b64)
+        except ValueError as e:
+            no_face_reason = str(e)
+        except Exception as e:
+            no_face_reason = f"Face processing error: {str(e)}"
 
-    try:
-        face_data = face_recognition_service.process_face_image(data.image_b64)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Face processing error: {str(e)}")
+    # If NO face detected or camera obscured: Log as Suspicious Evasion Proxy Alert!
+    if no_face_reason or not face_data:
+        obscured_thumb = face_recognition_service.create_obscured_thumbnail(
+            data.image_b64, reason="NO FACE / OBSCURED"
+        )
+        status_val = "flagged_no_face"
+        is_flagged_proxy = True
 
+        if target_session_id:
+            face_recognition_service.save_face_record(
+                session_id=target_session_id,
+                student_id=data.student_id,
+                student_name=student.name,
+                embedding=None,
+                thumbnail_b64=obscured_thumb,
+                is_flagged_proxy=True,
+                status="flagged_no_face",
+                reason=no_face_reason or "Camera obscured or no face detected"
+            )
+
+        if prior_log:
+            prior_log.status = "flagged_no_face"
+            prior_log.token_used = clean_token
+            prior_log.timestamp = client_time
+        else:
+            db_log = models.AttendanceLog(
+                student_id=data.student_id, 
+                subject_id=subject.id, 
+                session_id=target_session_id,
+                token_used=clean_token, 
+                timestamp=client_time,
+                status="flagged_no_face"
+            )
+            db.add(db_log)
+        db.commit()
+
+        await manager.broadcast(data.subject_code, {
+            "type": "NEW_ATTENDANCE",
+            "student_id": data.student_id,
+            "student_name": student.name,
+            "status": "flagged_no_face",
+            "is_flagged_proxy": True,
+            "photo": obscured_thumb,
+            "reason": "Camera Obscured / No Face Detected",
+            "message": f"Suspicious Evasion: {student.name} submitted with camera obscured or no face detected!"
+        })
+
+        raise HTTPException(
+            status_code=400,
+            detail="⚠️ Evasion Warning: No face detected in camera frame! This attempt has been logged and flagged to the professor as a potential proxy attempt."
+        )
+
+    # Face detected successfully:
     embedding = face_data.get("embedding")
     thumb_b64 = face_data.get("thumbnail_b64")
     is_flagged_proxy = False
@@ -417,18 +516,24 @@ async def verify_attendance(data: AttendanceVerify, db: Session = Depends(get_db
             is_flagged_proxy=is_flagged_proxy,
             matched_with_id=proxy_match.get("matched_student_id") if proxy_match else None,
             matched_with_name=proxy_match.get("matched_student_name") if proxy_match else None,
-            similarity=proxy_match.get("similarity") if proxy_match else None
+            similarity=proxy_match.get("similarity") if proxy_match else None,
+            status=status_val
         )
 
-    db_log = models.AttendanceLog(
-        student_id=data.student_id, 
-        subject_id=subject.id, 
-        session_id=target_session_id,
-        token_used=clean_token, 
-        timestamp=client_time,
-        status=status_val
-    )
-    db.add(db_log)
+    if prior_log:
+        prior_log.status = status_val
+        prior_log.token_used = clean_token
+        prior_log.timestamp = client_time
+    else:
+        db_log = models.AttendanceLog(
+            student_id=data.student_id, 
+            subject_id=subject.id, 
+            session_id=target_session_id,
+            token_used=clean_token, 
+            timestamp=client_time,
+            status=status_val
+        )
+        db.add(db_log)
     db.commit()
     
     await manager.broadcast(data.subject_code, {
@@ -475,7 +580,7 @@ def get_recent_sessions(subject_code: str, db: Session = Depends(get_db)):
         count = db.query(models.AttendanceLog).filter(models.AttendanceLog.session_id == s.id).count()
         proxy_count = db.query(models.AttendanceLog).filter(
             models.AttendanceLog.session_id == s.id,
-            models.AttendanceLog.status.in_(["flagged_proxy", "confirmed_proxy"])
+            models.AttendanceLog.status.in_(["flagged_proxy", "confirmed_proxy", "flagged_no_face"])
         ).count()
         results.append({
             "id": s.id,
@@ -513,11 +618,12 @@ def get_session_faces(session_id: int, db: Session = Depends(get_db)):
             "email": student.email if student else "N/A",
             "timestamp": log.timestamp.strftime("%Y-%m-%d %H:%M:%S") if log.timestamp else "N/A",
             "status": log.status,
-            "is_flagged_proxy": log.status in ["flagged_proxy", "confirmed_proxy"],
+            "is_flagged_proxy": log.status in ["flagged_proxy", "confirmed_proxy", "flagged_no_face"],
             "photo": rec.get("photo"),
             "matched_with_id": rec.get("matched_with_id"),
             "matched_with_name": rec.get("matched_with_name"),
-            "similarity": rec.get("similarity")
+            "similarity": rec.get("similarity"),
+            "reason": rec.get("reason")
         })
     return results
 
@@ -635,7 +741,7 @@ def build_export_response(logs: list, subject_code: str, subject_name: str, form
         for idx, log in enumerate(logs, start=1):
             student = log.student
             time_str = log.timestamp.strftime("%Y-%m-%d %H:%M:%S") if log.timestamp else "N/A"
-            status_display = "Verified" if log.status == "verified" else ("Proxy Flagged" if log.status == "flagged_proxy" else "Proxy Confirmed")
+            status_display = "Verified" if log.status == "verified" else ("Proxy Flagged" if log.status == "flagged_proxy" else ("No Face Detected" if log.status == "flagged_no_face" else "Proxy Confirmed"))
             row_data = [
                 idx,
                 log.student_id,
@@ -647,13 +753,13 @@ def build_export_response(logs: list, subject_code: str, subject_name: str, form
             ]
             ws.append(row_data)
             row_num = ws.max_row
-            fill_color = "FEF2F2" if log.status in ["flagged_proxy", "confirmed_proxy"] else ("F8FAFC" if idx % 2 == 0 else "FFFFFF")
+            fill_color = "FEF2F2" if log.status in ["flagged_proxy", "confirmed_proxy", "flagged_no_face"] else ("F8FAFC" if idx % 2 == 0 else "FFFFFF")
             for col_idx in range(1, len(headers) + 1):
                 c = ws.cell(row=row_num, column=col_idx)
                 c.fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type="solid")
                 c.border = thin_border
                 c.alignment = Alignment(horizontal="center" if col_idx in [1, 2, 5, 6, 7] else "left", vertical="center")
-                if log.status in ["flagged_proxy", "confirmed_proxy"] and col_idx == 6:
+                if log.status in ["flagged_proxy", "confirmed_proxy", "flagged_no_face"] and col_idx == 6:
                     c.font = Font(color="DC2626", bold=True)
 
         for col in ws.columns:
@@ -704,9 +810,9 @@ def build_export_response(logs: list, subject_code: str, subject_name: str, form
             student = log.student
             time_str = log.timestamp.strftime("%H:%M:%S") if log.timestamp else "N/A"
             binding_str = "Bound" if (student and student.hardware_id) else "Unbound"
-            status_str = "Verified" if log.status == "verified" else ("FLAGGED PROXY" if log.status == "flagged_proxy" else "CONFIRMED PROXY")
+            status_str = "Verified" if log.status == "verified" else ("FLAGGED PROXY" if log.status == "flagged_proxy" else ("NO FACE DETECTED" if log.status == "flagged_no_face" else "CONFIRMED PROXY"))
             
-            is_proxy = log.status in ["flagged_proxy", "confirmed_proxy"]
+            is_proxy = log.status in ["flagged_proxy", "confirmed_proxy", "flagged_no_face"]
             if is_proxy:
                 pdf.set_fill_color(254, 226, 226) # light red
                 pdf.set_text_color(185, 28, 28)
